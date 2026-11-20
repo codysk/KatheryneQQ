@@ -60,13 +60,34 @@ KATHERYNE_CONFIG=./config.json /path/to/QQRoot/qq --no-sandbox --headless
 
 ### 4. OneBot v11
 
-- WebSocket 服务端：`ws://127.0.0.1:6700`
+- WebSocket 服务端：`ws://127.0.0.1:6700`（支持 access_token）
+- 反向 WebSocket 客户端：配置 `reverseWs.urls`
 - HTTP 服务端：`http://127.0.0.1:5700/send_private_msg?user_id=...`
 - 事件上报（HTTP POST）：配置 `http.event_post_url`
 
-已支持动作：`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`、`get_msg`、`get_login_info`、`get_friend_list`、`get_group_list`、`get_group_member_list`、`get_group_info`、`get_stranger_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_kick`、`set_group_leave`、`set_group_card`、`send_like`、`can_send_image`、`can_send_record`、`get_status`、`get_version_info`。
+响应 envelope 遵循 OB11 规范：`{ status, retcode, data, message?, echo }`；retcode：0 成功 / 1400 参数错误 / 1403 未授权 / 1404 动作不支持 / 1500 内部错误。
+
+标准动作（32 个）：`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_kick`、`set_group_leave`、`set_group_card`、`set_group_name`、`set_group_admin`、`set_group_avatar`、`set_friend_add_request`、`set_group_add_request`、`can_send_image`、`can_send_record`、`get_status`、`get_version_info`、`get_cookies`、`get_csrf_token`。
 
 消息段：`text`、`at`、`face`、`image`、`record`、`reply`、`json`。
+
+事件：`message`（私聊/群聊/自发自）、`notice`（群增减员/禁言/踢出/离线）、`request`（好友/加群请求）、`meta_event`（lifecycle/heartbeat）。
+
+### 5. Web 控制台
+
+启动后打开 `http://127.0.0.1:6099/console`：
+
+- 实时状态（运行阶段/QQ 版本/AppID）
+- 扫码登录（二维码直接在页面显示）/ 快速登录
+- 事件流（最近 500 条，分类着色）
+- 动作调试器（下拉选择 32 个动作 + JSON 参数执行）
+- 运行日志
+
+```json
+{
+  "console": { "enabled": true, "host": "0.0.0.0", "port": 6099, "username": "", "password": "" }
+}
+```
 
 ### 卸载
 

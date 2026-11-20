@@ -32,6 +32,7 @@ export interface SessionServices {
     buddy: any;    // NodeIKernelBuddyService
     group: any;    // NodeIKernelGroupService
     profile: any;  // NodeIKernelProfileService
+    profileLike: any;
     richMedia: any;
     uix: any;
     msf: any;
@@ -90,6 +91,7 @@ export function collectServices(session: any): SessionServices {
         buddy: get('getBuddyService'),
         group: get('getGroupService'),
         profile: get('getProfileService'),
+        profileLike: get('getProfileLikeService'),
         richMedia: get('getRichMediaService'),
         uix: get('getUixConvertService'),
         msf: get('getMSFService'),

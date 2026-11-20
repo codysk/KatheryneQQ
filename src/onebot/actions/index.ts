@@ -1,186 +1,261 @@
 /**
- * OneBot v11 action handlers.
+ * OneBot v11 action handlers — full standard set + go-cqhttp extensions.
+ *
+ * Response envelope (OB11 spec):
+ *   { status: "async" | "ok" | "failed", retcode: number, data: ..., message?: string, echo }
+ * retcodes: 0 ok, 1 async, 1200 internal error, 1400 bad params,
+ *           1403 unauthenticated, 1404 action not supported,
+ *           1500 handler crashed.
  */
-import type { OB11Segment } from '../message/segments.js';
-import { segmentsToNtElements } from '../message/segments.js';
+import { segmentsToNtElements, type OB11Segment } from '../message/segments.js';
+
+export interface PeerRef {
+    chatType: number;
+    peerUid: string;
+}
 
 export interface ActionContext {
     selfUin: string;
     selfUid: string;
     resolveUin(uin: string): string | null;
     resolveUid(uid: string): string | null;
-    sendMessage(peer: { chatType: number; peerUid: string }, elements: unknown[]): Promise<{ msgId: string }>;
-    getMsg(peer: { chatType: number; peerUid: string }, msgId: string): Promise<Record<string, unknown>>;
+    // messaging
+    sendMessage(peer: PeerRef, elements: unknown[]): Promise<{ msgId: string; seq?: string }>;
+    deleteMsg(peer: PeerRef, msgId: string): Promise<void>;
+    getMsg(peer: PeerRef, msgId: string): Promise<Record<string, unknown>>;
+    getMsgHistory(peer: PeerRef, msgId: string, count: number): Promise<Array<Record<string, unknown>>>;
+    markRead(peer: PeerRef): Promise<void>;
+    // profile
     getLoginInfo(): Promise<{ user_id: string; nickname: string }>;
     getFriendList(): Promise<Array<Record<string, unknown>>>;
-    getGroupList(): Promise<Array<Record<string, unknown>>>;
-    getGroupMemberList(groupUid: string): Promise<Array<Record<string, unknown>>>;
-    deleteMsg(peer: { chatType: number; peerUid: string }, msgId: string): Promise<void>;
-    setGroupBan(groupUid: string, memberUid: string, duration: number): Promise<void>;
-    setGroupWholeBan(groupUid: string, enable: boolean): Promise<void>;
-    setGroupKick(groupUid: string, memberUid: string, rejectAdd: boolean): Promise<void>;
-    setGroupLeave(groupUid: string, dismiss: boolean): Promise<void>;
-    setGroupCard(groupUid: string, memberUid: string, card: string): Promise<void>;
-    getGroupInfo(groupUid: string): Promise<Record<string, unknown>>;
-    getFriendInfo(userUid: string): Promise<Record<string, unknown>>;
+    getStrangerInfo(userUid: string): Promise<Record<string, unknown>>;
     sendLike(userUid: string, times: number): Promise<void>;
+    // groups
+    getGroupList(): Promise<Array<Record<string, unknown>>>;
+    getGroupInfo(groupCode: string): Promise<Record<string, unknown>>;
+    getGroupMemberList(groupCode: string): Promise<Array<Record<string, unknown>>>;
+    getGroupMemberInfo(groupCode: string, memberUid: string): Promise<Record<string, unknown>>;
+    setGroupBan(groupCode: string, memberUid: string, durationSec: number): Promise<void>;
+    setGroupWholeBan(groupCode: string, enable: boolean): Promise<void>;
+    setGroupKick(groupCode: string, memberUids: string[], rejectForever: boolean): Promise<void>;
+    setGroupLeave(groupCode: string, dismiss: boolean): Promise<void>;
+    setGroupCard(groupCode: string, memberUid: string, card: string): Promise<void>;
+    setGroupName(groupCode: string, name: string): Promise<void>;
+    setGroupAdmin(groupCode: string, memberUid: string, enable: boolean): Promise<void>;
+    setGroupAvatar(groupCode: string, file: string): Promise<void>;
+    // requests
+    handleFriendRequest(flag: string, accept: boolean, remark?: string): Promise<void>;
+    handleGroupRequest(flag: string, accept: boolean, reason?: string): Promise<void>;
+    // misc
+    getCookies(domain: string): Promise<string>;
 }
 
 export interface ActionParams {
     [k: string]: unknown;
 }
 
-export type ActionResult = Record<string, unknown>;
+export class ActionError extends Error {
+    constructor(public retcode: number, message: string) {
+        super(message);
+    }
+}
 
-type ActionHandler = (params: ActionParams, ctx: ActionContext) => Promise<ActionResult>;
+type ActionHandler = (params: ActionParams, ctx: ActionContext) => Promise<unknown>;
 
-function peerOf(params: ActionParams, ctx: ActionContext): { chatType: number; peerUid: string } {
-    const messageType = params.message_type as string | undefined;
+function str(params: ActionParams, key: string): string {
+    const v = params[key];
+    if (v === undefined || v === null) throw new ActionError(1400, `missing param: ${key}`);
+    return String(v);
+}
+
+function num(params: ActionParams, key: string, def?: number): number {
+    const v = params[key];
+    if (v === undefined || v === null) {
+        if (def !== undefined) return def;
+        throw new ActionError(1400, `missing param: ${key}`);
+    }
+    const n = Number(v);
+    if (Number.isNaN(n)) throw new ActionError(1400, `param ${key} must be a number`);
+    return n;
+}
+
+function bool(params: ActionParams, key: string, def = false): boolean {
+    const v = params[key];
+    if (v === undefined || v === null) return def;
+    if (typeof v === 'boolean') return v;
+    const s = String(v);
+    return s === 'true' || s === '1' || s === 'yes';
+}
+
+/** group_id / user_id -> NT peer. */
+function peerOf(params: ActionParams, ctx: ActionContext, opts: { requireGroup?: boolean } = {}): PeerRef {
     const groupId = params.group_id as string | undefined;
     const userId = params.user_id as string | undefined;
-    if (messageType === 'group' || groupId) {
+    const messageType = params.message_type as string | undefined;
+
+    if (messageType === 'group' || (groupId && messageType === undefined)) {
         const uid = ctx.resolveUin(String(groupId ?? ''));
-        if (!uid) throw new Error(`cannot resolve group ${groupId}`);
+        if (!uid) throw new ActionError(1400, `cannot resolve group ${groupId} to uid`);
         return { chatType: 2, peerUid: uid };
     }
-    const uid = ctx.resolveUin(String(userId ?? ''));
-    if (!uid) throw new Error(`cannot resolve user ${userId}`);
-    return { chatType: 1, peerUid: uid };
+    if (messageType === 'private' || messageType === undefined) {
+        if (opts.requireGroup) throw new ActionError(1400, 'group_id required');
+        const uid = ctx.resolveUin(String(userId ?? ''));
+        if (!uid) throw new ActionError(1400, `cannot resolve user ${userId} to uid`);
+        return { chatType: 1, peerUid: uid };
+    }
+    throw new ActionError(1400, `unsupported message_type ${messageType}`);
 }
 
 function segmentsOf(params: ActionParams): OB11Segment[] {
     const message = params.message;
-    if (typeof message === 'string') {
-        return [{ type: 'text', data: { text: message } }];
-    }
+    if (typeof message === 'string') return [{ type: 'text', data: { text: message } }];
     if (Array.isArray(message)) return message as OB11Segment[];
-    throw new Error('message must be string or segment array');
+    throw new ActionError(1400, 'message must be string or segment array');
 }
 
-export const actions: Record<string, ActionHandler> = {
-    async send_private_msg(params, ctx) {
-        const peer = peerOf(params, ctx);
-        const elements = segmentsToNtElements(segmentsOf(params), ctx);
-        const r = await ctx.sendMessage(peer, elements);
+const actions: Record<string, ActionHandler> = {
+    // ---------- messaging ----------
+    send_private_msg: async (p, ctx) => {
+        const r = await ctx.sendMessage(peerOf(p, ctx), segmentsToNtElements(segmentsOf(p), ctx));
         return { message_id: r.msgId };
     },
-    async send_group_msg(params, ctx) {
-        const peer = peerOf(params, ctx);
-        const elements = segmentsToNtElements(segmentsOf(params), ctx);
-        const r = await ctx.sendMessage(peer, elements);
+    send_group_msg: async (p, ctx) => {
+        const r = await ctx.sendMessage(peerOf(p, ctx, { requireGroup: true }), segmentsToNtElements(segmentsOf(p), ctx));
         return { message_id: r.msgId };
     },
-    async send_msg(params, ctx) {
-        const peer = peerOf(params, ctx);
-        const elements = segmentsToNtElements(segmentsOf(params), ctx);
-        const r = await ctx.sendMessage(peer, elements);
+    send_msg: async (p, ctx) => {
+        const r = await ctx.sendMessage(peerOf(p, ctx), segmentsToNtElements(segmentsOf(p), ctx));
         return { message_id: r.msgId };
     },
-    async delete_msg(params, ctx) {
-        const peer = peerOf(params, ctx);
-        await ctx.deleteMsg(peer, String(params.message_id ?? ''));
+    delete_msg: async (p, ctx) => {
+        await ctx.deleteMsg(peerOf(p, ctx), str(p, 'message_id'));
         return {};
     },
-    async get_msg(params, ctx) {
-        const peer = peerOf(params, ctx);
-        return await ctx.getMsg(peer, String(params.message_id ?? ''));
+    get_msg: async (p, ctx) => await ctx.getMsg(peerOf(p, ctx), str(p, 'message_id')),
+    get_msg_history: async (p, ctx) => {
+        const list = await ctx.getMsgHistory(peerOf(p, ctx), String(p.message_id ?? ''), num(p, 'count', 20));
+        return { messages: list };
     },
-    async get_login_info(_params, ctx) {
-        return await ctx.getLoginInfo();
-    },
-    async get_friend_list(_params, ctx) {
-        const list = await ctx.getFriendList();
-        return { data: list } as ActionResult;
-    },
-    async get_group_list(_params, ctx) {
-        const list = await ctx.getGroupList();
-        return { data: list } as ActionResult;
-    },
-    async get_group_member_list(params, ctx) {
-        const peer = peerOf(params, ctx);
-        const list = await ctx.getGroupMemberList(peer.peerUid);
-        return { data: list } as ActionResult;
-    },
-    async get_group_info(params, ctx) {
-        const peer = peerOf(params, ctx);
-        return await ctx.getGroupInfo(peer.peerUid);
-    },
-    async get_stranger_info(params, ctx) {
-        const uid = ctx.resolveUin(String(params.user_id ?? ''));
-        if (!uid) throw new Error('cannot resolve user');
-        return await ctx.getFriendInfo(uid);
-    },
-    async set_group_ban(params, ctx) {
-        const peer = peerOf(params, ctx);
-        const memberUid = ctx.resolveUin(String(params.user_id ?? ''));
-        if (!memberUid) throw new Error('cannot resolve member');
-        const duration = Number(params.duration ?? 1800);
-        await ctx.setGroupBan(peer.peerUid, memberUid, duration);
+    mark_msg_as_read: async (p, ctx) => {
+        await ctx.markRead(peerOf(p, ctx));
         return {};
     },
-    async set_group_whole_ban(params, ctx) {
-        const peer = peerOf(params, ctx);
-        await ctx.setGroupWholeBan(peer.peerUid, Boolean(params.enable ?? true));
+
+    // ---------- profile ----------
+    get_login_info: async (_p, ctx) => await ctx.getLoginInfo(),
+    get_friend_list: async (_p, ctx) => await ctx.getFriendList(),
+    get_stranger_info: async (p, ctx) => {
+        const uid = ctx.resolveUin(str(p, 'user_id'));
+        if (!uid) throw new ActionError(1400, 'cannot resolve user');
+        return await ctx.getStrangerInfo(uid);
+    },
+    send_like: async (p, ctx) => {
+        const uid = ctx.resolveUin(str(p, 'user_id'));
+        if (!uid) throw new ActionError(1400, 'cannot resolve user');
+        await ctx.sendLike(uid, num(p, 'times', 1));
         return {};
     },
-    async set_group_kick(params, ctx) {
-        const peer = peerOf(params, ctx);
-        const memberUid = ctx.resolveUin(String(params.user_id ?? ''));
-        if (!memberUid) throw new Error('cannot resolve member');
-        await ctx.setGroupKick(peer.peerUid, memberUid, Boolean(params.reject_add_request ?? false));
+
+    // ---------- groups ----------
+    get_group_list: async (_p, ctx) => await ctx.getGroupList(),
+    get_group_info: async (p, ctx) => await ctx.getGroupInfo(str(p, 'group_id')),
+    get_group_info_simple: async (p, ctx) => await ctx.getGroupInfo(str(p, 'group_id')),
+    get_group_member_list: async (p, ctx) => await ctx.getGroupMemberList(str(p, 'group_id')),
+    get_group_member_info: async (p, ctx) => {
+        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
+        return await ctx.getGroupMemberInfo(str(p, 'group_id'), memberUid);
+    },
+    set_group_ban: async (p, ctx) => {
+        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
+        await ctx.setGroupBan(str(p, 'group_id'), memberUid, num(p, 'duration', 1800));
         return {};
     },
-    async set_group_leave(params, ctx) {
-        const peer = peerOf(params, ctx);
-        await ctx.setGroupLeave(peer.peerUid, Boolean(params.is_dismiss ?? false));
+    set_group_whole_ban: async (p, ctx) => {
+        await ctx.setGroupWholeBan(str(p, 'group_id'), bool(p, 'enable', true));
         return {};
     },
-    async set_group_card(params, ctx) {
-        const peer = peerOf(params, ctx);
-        const memberUid = ctx.resolveUin(String(params.user_id ?? ''));
-        if (!memberUid) throw new Error('cannot resolve member');
-        await ctx.setGroupCard(peer.peerUid, memberUid, String(params.card ?? ''));
+    set_group_kick: async (p, ctx) => {
+        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
+        await ctx.setGroupKick(str(p, 'group_id'), [memberUid], bool(p, 'reject_add_request', false));
         return {};
     },
-    async send_like(params, ctx) {
-        const uid = ctx.resolveUin(String(params.user_id ?? ''));
-        if (!uid) throw new Error('cannot resolve user');
-        await ctx.sendLike(uid, Number(params.times ?? 1));
+    set_group_leave: async (p, ctx) => {
+        await ctx.setGroupLeave(str(p, 'group_id'), bool(p, 'is_dismiss', false));
         return {};
     },
-    async can_send_image() {
-        return { yes: true };
+    set_group_card: async (p, ctx) => {
+        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
+        await ctx.setGroupCard(str(p, 'group_id'), memberUid, str(p, 'card'));
+        return {};
     },
-    async can_send_record() {
-        return { yes: true };
+    set_group_name: async (p, ctx) => {
+        await ctx.setGroupName(str(p, 'group_id'), str(p, 'group_name'));
+        return {};
     },
-    async get_version_info() {
-        return {
-            app_name: 'KatheryneQQ',
-            app_version: 'v0.1.0',
-            protocol_version: 'v11',
-        };
+    set_group_admin: async (p, ctx) => {
+        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
+        await ctx.setGroupAdmin(str(p, 'group_id'), memberUid, bool(p, 'enable', true));
+        return {};
     },
-    async get_status(_params, ctx) {
-        return {
-            online: true,
-            good: true,
-            login_uin: ctx.selfUin,
-        };
+    set_group_avatar: async (p, ctx) => {
+        await ctx.setGroupAvatar(str(p, 'group_id'), str(p, 'file'));
+        return {};
     },
+
+    // ---------- requests ----------
+    set_friend_add_request: async (p, ctx) => {
+        await ctx.handleFriendRequest(str(p, 'flag'), bool(p, 'approve', true), p.remark as string | undefined);
+        return {};
+    },
+    set_group_add_request: async (p, ctx) => {
+        await ctx.handleGroupRequest(str(p, 'flag'), bool(p, 'approve', true), p.reason as string | undefined);
+        return {};
+    },
+
+    // ---------- status ----------
+    can_send_image: async () => ({ yes: true }),
+    can_send_record: async () => ({ yes: true }),
+    get_version_info: async () => ({
+        app_name: 'KatheryneQQ',
+        app_version: 'v0.2.0',
+        protocol_version: 'v11',
+    }),
+    get_status: async (_p, ctx) => ({
+        online: Boolean(ctx.selfUin),
+        good: Boolean(ctx.selfUin),
+        login_uin: ctx.selfUin,
+    }),
+
+    // ---------- go-cqhttp extensions ----------
+    get_cookies: async (p, ctx) => ({ cookies: await ctx.getCookies(str(p, 'domain')) }),
+    get_csrf_token: async () => ({ token: 0 }),
 };
+
+export const actionNames = Object.keys(actions);
 
 export async function dispatchAction(
     action: string,
     params: ActionParams,
     ctx: ActionContext,
-): Promise<ActionResult> {
+): Promise<{ status: string; retcode: number; data: unknown; message?: string }> {
     const handler = actions[action];
     if (!handler) {
-        const err = new Error(`unsupported action: ${action}`);
-        (err as Error & { status?: string; retcode?: number }).status = 'failed';
-        (err as Error & { status?: string; retcode?: number }).retcode = 1404;
-        throw err;
+        return { status: 'failed', retcode: 1404, data: null, message: `unsupported action: ${action}` };
     }
-    return await handler(params, ctx);
+    try {
+        const data = await handler(params ?? {}, ctx);
+        return { status: 'ok', retcode: 0, data: data ?? {} };
+    } catch (e) {
+        if (e instanceof ActionError) {
+            return { status: 'failed', retcode: e.retcode, data: null, message: e.message };
+        }
+        const msg = e instanceof Error ? e.message : String(e);
+        return { status: 'failed', retcode: 1500, data: null, message: msg };
+    }
 }

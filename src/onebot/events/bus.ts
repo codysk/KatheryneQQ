@@ -1,5 +1,10 @@
 /**
  * OneBot v11 event model + dispatcher.
+ *
+ * Event envelope (OB11 spec): every event carries `time`, `self_id`,
+ * `post_type`; message events add `message_type`, notice events
+ * `notice_type`, request events `request_type`, meta events
+ * `meta_event_type`.
  */
 export interface OB11Event {
     time: number;
@@ -42,6 +47,8 @@ export type EventListener = (event: OB11AnyEvent) => void;
 
 export class EventBus {
     private listeners = new Set<EventListener>();
+    /** Ring buffer of recent events for the console page. */
+    recent: OB11AnyEvent[] = [];
 
     subscribe(fn: EventListener): () => void {
         this.listeners.add(fn);
@@ -49,6 +56,8 @@ export class EventBus {
     }
 
     emit(event: OB11AnyEvent): void {
+        this.recent.push(event);
+        if (this.recent.length > 500) this.recent.shift();
         for (const fn of this.listeners) {
             try {
                 fn(event);
@@ -94,4 +103,67 @@ export function segmentsToRawText(segments: unknown[]): string {
         }
     }
     return out;
+}
+
+/**
+ * NT group notify types (NodeIKernelGroupListener onGroupNotifiesUpdated).
+ * Kernel notify.type values mapped to OB11 sub types.
+ */
+export function groupNotifyToNotice(
+    notify: Record<string, unknown>,
+    selfUin: string,
+    resolve: (uid: string) => string | null,
+): OB11AnyEvent | null {
+    const type = Number(notify.type ?? 0);
+    const groupCode = String(notify.groupCode ?? notify.group_id ?? '');
+    const user1Uid = String(notify.user1Uid ?? notify.u1Uid ?? '');
+    const user2Uid = String(notify.user2Uid ?? notify.u2Uid ?? '');
+    const user1 = user1Uid ? resolve(user1Uid) ?? user1Uid : '';
+    const user2 = user2Uid ? resolve(user2Uid) ?? user2Uid : '';
+    const base = {
+        time: Math.floor(Date.now() / 1000),
+        self_id: selfUin,
+        post_type: 'notice' as const,
+        group_id: groupCode,
+    };
+    switch (type) {
+        case 5: // member leave (kicked or quit)
+            return { ...base, notice_type: 'group_decrease', sub_type: 'kick', operator_id: user1, user_id: user2 };
+        case 7: // member increase (approved join)
+            return { ...base, notice_type: 'group_increase', sub_type: 'approve', operator_id: '0', user_id: user1 };
+        case 10: // invited by admin
+            return { ...base, notice_type: 'group_increase', sub_type: 'invite', operator_id: user1, user_id: user2 };
+        case 12: // join request pending
+            return {
+                ...base,
+                post_type: 'request' as const,
+                request_type: 'group' as const,
+                sub_type: 'add',
+                user_id: user1,
+                comment: String(notify.postScript ?? ''),
+                flag: String(notify.seqId ?? notify.seq ?? ''),
+            };
+        case 13: // friend request via group
+            return {
+                ...base,
+                post_type: 'request' as const,
+                request_type: 'friend' as const,
+                sub_type: 'group',
+                user_id: user1,
+                comment: String(notify.postScript ?? ''),
+                flag: String(notify.seqId ?? notify.seq ?? ''),
+            };
+        case 14: // invited to group (self)
+            return {
+                ...base,
+                post_type: 'request' as const,
+                request_type: 'group' as const,
+                sub_type: 'invite',
+                user_id: user1,
+                comment: '',
+                flag: String(notify.seqId ?? notify.seq ?? ''),
+            };
+        default:
+            return null;
+    }
 }

@@ -16,9 +16,7 @@
  */
 import { initRuntime } from './core/runtime.js';
 
-const startedAt = Date.now();
-
-initRuntime(startedAt).catch((err) => {
+initRuntime().catch((err) => {
     // Last-resort sink: the QQ process must not die with a dialog box.
     console.error('[katheryne] fatal boot error', err);
     process.exit(1);

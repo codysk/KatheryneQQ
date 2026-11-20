@@ -177,6 +177,7 @@ export const SESSION_SERVICE_ACCESSORS = [
     'getBuddyService',
     'getGroupService',
     'getProfileService',
+    'getProfileLikeService',
     'getRichMediaService',
     'getUixConvertService',
     'getMSFService',

@@ -218,7 +218,7 @@ export class NetworkManager {
                 const parsed = JSON.parse(text) as { action?: string; params?: ActionParams; echo?: unknown };
                 if (parsed.action) {
                     const result = await dispatchAction(parsed.action, parsed.params ?? {}, this.actionCtx());
-                    return JSON.stringify({ status: 'ok', retcode: 0, data: result, echo: parsed.echo ?? null });
+                    return JSON.stringify({ ...result, echo: parsed.echo ?? null });
                 }
                 return null;
             } catch (e) {
