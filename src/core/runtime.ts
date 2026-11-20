@@ -100,12 +100,44 @@ class KatheryneRuntime {
     // ---------------- login ----------------
 
     private loginListenersInstalled = false;
+    private loginConnected = false;
+    private pendingQRRequest = false;
+    private loginServiceInstance: unknown = null;
+
+    private loginSvc() {
+        // Single shared instance: kernel may return fresh NAPI objects per
+        // .get() call; listeners must live on the same object we connect().
+        if (!this.loginServiceInstance && this.kernel) {
+            this.loginServiceInstance = this.kernel.wrapper.NodeIKernelLoginService.get();
+        }
+        return this.loginServiceInstance;
+    }
 
     private installLoginListeners(): void {
         if (this.loginListenersInstalled || !this.kernel) return;
-        const svc = this.kernel.wrapper.NodeIKernelLoginService.get();
+        const svc = this.loginSvc() as {
+            addKernelLoginListener(listener: unknown): number;
+            connect(): boolean;
+            getQRCodePicture(): boolean;
+            cancel(): void;
+        };
         this.loginListenersInstalled = true;
         svc.addKernelLoginListener({
+            onLoginConnected: () => {
+                // NT requires connect() first; the QR request is only accepted
+                // once the login service reports connected (same order NapCat
+                // uses: listener -> connect() -> onLoginConnected -> QR).
+                this.loginConnected = true;
+                this.consoleMgr?.log('login service connected');
+                if (this.pendingQRRequest) {
+                    this.pendingQRRequest = false;
+                    try {
+                        svc.getQRCodePicture();
+                    } catch (e) {
+                        this.loginError = `getQRCodePicture failed: ${e instanceof Error ? e.message : String(e)}`;
+                    }
+                }
+            },
             onQRCodeGetPicture: (arg: { pngBase64QrcodeData?: string; qrcodeUrl?: string }) => {
                 const b64 = arg?.pngBase64QrcodeData ?? '';
                 this.qrcodeDataUrl = b64.startsWith('data:') ? b64 : `data:image/png;base64,${b64.replace(/^.*base64,/, '')}`;
@@ -114,9 +146,23 @@ class KatheryneRuntime {
                 this.consoleMgr?.log('QR code received, waiting for scan');
             },
             onQRCodeSessionUserScaned: () => this.consoleMgr?.log('QR scanned, confirm on phone'),
-            onQRCodeSessionFailed: (msg?: unknown) => {
+            onQRCodeSessionFailed: (errType?: number, errCode?: number) => {
+                // errType 1 / errCode 3 = QR expired: fetch the next code
+                // automatically (same policy as NapCat). Other failures keep
+                // the code on screen for a manual refresh.
+                if (errType === 1 && errCode === 3) {
+                    this.loginError = '二维码已过期，正在刷新';
+                    try {
+                        const svc = this.loginSvc() as { getQRCodePicture(): boolean };
+                        svc.getQRCodePicture();
+                    } catch {
+                        this.qrcodeDataUrl = null;
+                        this.phase = 'awaiting_login';
+                    }
+                    return;
+                }
                 this.qrcodeDataUrl = null;
-                this.loginError = `QR session failed: ${String(msg ?? 'expired')}`;
+                this.loginError = `QR session failed: type=${errType} code=${errCode}`;
                 this.phase = 'awaiting_login';
             },
             onQRCodeLoginSucceed: (arg: Record<string, unknown>) => {
@@ -161,22 +207,32 @@ class KatheryneRuntime {
         this.installLoginListeners();
         this.phase = 'logging_in';
         this.loginError = null;
-        const svc = this.kernel.wrapper.NodeIKernelLoginService.get();
-        svc.startPolling();
+        const svc = this.loginSvc() as {
+            connect(): boolean;
+            getQRCodePicture(): boolean;
+        };
+        if (!this.loginConnected) {
+            // First QR request in this process: connect() now; the picture is
+            // fetched from onLoginConnected once the service is up.
+            this.pendingQRRequest = true;
+            svc.connect();
+            this.consoleMgr?.log('login service connecting (QR queued)');
+            return;
+        }
         svc.getQRCodePicture();
         this.consoleMgr?.log('QR login requested');
     }
 
     async cancelLogin(): Promise<void> {
         if (!this.kernel) return;
-        const svc = this.kernel.wrapper.NodeIKernelLoginService.get();
+        const svc = this.loginSvc() as { cancel(): void };
         try {
             svc.cancel();
-            svc.abortPolling();
         } catch {
             // already idle
         }
         this.qrcodeDataUrl = null;
+        this.pendingQRRequest = false;
         this.phase = 'awaiting_login';
     }
 

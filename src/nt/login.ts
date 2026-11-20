@@ -83,8 +83,15 @@ export class LoginFlow {
         );
     }
 
+    private loginServiceInstance: ReturnType<WrapperNodeApi['NodeIKernelLoginService']['get']> | null = null;
+
     private loginService() {
-        return this.wrapper.NodeIKernelLoginService.get();
+        // The kernel hands out a fresh NAPI object per .get(); reusing one
+        // instance keeps listener registrations bound to the live service.
+        if (!this.loginServiceInstance) {
+            this.loginServiceInstance = this.wrapper.NodeIKernelLoginService.get();
+        }
+        return this.loginServiceInstance;
     }
 
     initLoginConfig(): void {
