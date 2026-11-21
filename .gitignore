@@ -4,3 +4,4 @@ work/
 *.log
 .DS_Store
 config.json
+qr_current.png
