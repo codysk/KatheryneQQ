@@ -63,6 +63,7 @@ class KatheryneRuntime {
     private network: NetworkManager | null = null;
     private uinToUid = new Map<string, string>();
     private uidToUin = new Map<string, string>();
+    private groupListCache = new Map<string, Record<string, unknown>>();
 
     async start(): Promise<void> {
         // 1. Console + network up first (works pre-login).
@@ -311,6 +312,17 @@ class KatheryneRuntime {
         const groupService = this.services?.group;
         if (!groupService) return;
         groupService.addKernelGroupListener({
+            onGroupListUpdate: (_updateType: unknown, groupList: Array<Record<string, unknown>>) => {
+                for (const g of groupList ?? []) {
+                    const code = String(g.groupCode ?? '');
+                    if (code) this.groupListCache.set(code, {
+                        group_id: code,
+                        group_name: String(g.groupName ?? ''),
+                        member_count: Number(g.memberCount ?? 0),
+                        max_member_count: Number(g.maxMember ?? 0),
+                    });
+                }
+            },
             onGroupNotifiesUpdated: (_doubt: boolean, notifies: Array<Record<string, unknown>>) => {
                 for (const n of notifies ?? []) {
                     const ev = groupNotifyToNotice(n, this.selfUin, (uid) => this.uidToUin.get(uid) ?? null);
@@ -541,7 +553,8 @@ class KatheryneRuntime {
             },
             async getMsgHistory(peer, msgId, count) {
                 const svc = self.requireServices().msg;
-                const r = await svc.getMsgHistory(peer, msgId, count, false);
+                // kernel: getMsgsIncludeSelf(peer, startMsgId, count, isReverseOrder)
+                const r = await svc.getMsgsIncludeSelf(peer, msgId, count, false);
                 const list = (r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[];
                 return list.map((raw) => {
                     const segments = ntElementsToSegments(
@@ -567,21 +580,53 @@ class KatheryneRuntime {
             },
             async getFriendList() {
                 const buddy = self.requireServices().buddy;
-                const res = await buddy.getBuddyListV2('0', true, 1).catch(() => null);
-                const infos = res?.data?.buddyList ?? [];
-                return infos.map((f: Record<string, unknown>) => ({
-                    user_id: String(f.uin ?? ''),
-                    nickname: String(f.nick ?? ''),
-                    remark: String(f.remark ?? ''),
-                }));
+                const profile = self.requireServices().profile;
+                // categories: [{buddyUids: [...]}] -> profile.getCoreAndBaseInfo('nodeStore', uids)
+                let uids: string[] = [];
+                try {
+                    const res = await buddy.getBuddyListV2('0', true, 0);
+                    const cats = res?.data ?? [];
+                    for (const cat of cats) for (const u of cat.buddyUids ?? []) uids.push(String(u));
+                } catch { /* empty */ }
+                const out: Array<Record<string, unknown>> = [];
+                if (uids.length > 0) {
+                    try {
+                        const res = await profile.getCoreAndBaseInfo('nodeStore', uids);
+                        const infoMap = (res?.result?.info ?? res?.info ?? {}) as Record<string, Record<string, unknown>>;
+                        for (const uid of uids) {
+                            const info = (infoMap[uid] ?? {}) as Record<string, any>;
+                            const core = info.coreInfo ?? {};
+                            const uin = String(core.uin ?? info.uin ?? '');
+                            if (uin && uin !== '0') {
+                                self.uidToUin.set(uid, uin);
+                                self.uinToUid.set(uin, uid);
+                            }
+                            out.push({
+                                user_id: uin || self.uidToUin.get(uid) || uid,
+                                nickname: String(core.nick ?? info.nick ?? ''),
+                                remark: String(info.remark ?? ''),
+                            });
+                        }
+                    } catch { /* fall through */ }
+                }
+                return out;
             },
             async getStrangerInfo(userUid) {
                 const profile = self.requireServices().profile;
-                const res = await profile.getUserSimpleInfo(userUid);
-                const p = (res?.result ?? res) as Record<string, unknown>;
+                // kernel: getUserSimpleInfo(force, uids[]) — returns Map keyed by uid
+                const res = await profile.getUserSimpleInfo(true, [userUid]);
+                const infoMap = (res?.result?.info ?? res?.info ?? res) as Record<string, Record<string, unknown>> | Map<string, Record<string, unknown>>;
+                let info: Record<string, unknown> | undefined;
+                if (infoMap instanceof Map) info = infoMap.get(userUid);
+                else if (infoMap && typeof infoMap === 'object') {
+                    info = (infoMap as Record<string, Record<string, unknown>>)[userUid]
+                        ?? Object.values(infoMap as Record<string, Record<string, unknown>>)[0];
+                }
+                const core = ((info as Record<string, any>)?.coreInfo ?? info ?? {}) as Record<string, unknown>;
+                const base = ((info as Record<string, any>)?.baseInfo ?? {}) as Record<string, unknown>;
                 return {
-                    user_id: String(p.uin ?? self.uidToUin.get(userUid) ?? ''),
-                    nickname: String(p.nick ?? ''),
+                    user_id: String(core.uin ?? base.uin ?? self.uidToUin.get(userUid) ?? ''),
+                    nickname: String(core.nick ?? base.nick ?? ''),
                 };
             },
             async sendLike(userUid, times) {
@@ -595,18 +640,22 @@ class KatheryneRuntime {
             },
             async getGroupList() {
                 const group = self.requireServices().group;
-                const res = await group.getGroupList(true, false);
-                const infos = res?.result?.groupList ?? res?.groupList ?? [];
-                return infos.map((g: Record<string, unknown>) => ({
-                    group_id: String(g.groupCode ?? ''),
-                    group_name: String(g.groupName ?? ''),
-                    member_count: Number(g.memberCount ?? 0),
-                    max_member_count: Number(g.maxMember ?? 0),
-                }));
+                // kernel returns only {result} — the actual list arrives via
+                // onGroupListUpdate listener, which populates groupListCache.
+                try { await group.getGroupList(true); } catch { /* listener path */ }
+                await new Promise((r) => setTimeout(r, 800));
+                if (self.groupListCache.size === 0) {
+                    try { await group.getGroupList(true); } catch { /* retry */ }
+                    await new Promise((r) => setTimeout(r, 800));
+                }
+                return Array.from(self.groupListCache.values());
             },
             async getGroupInfo(groupCode) {
+                const cached = self.groupListCache.get(groupCode);
+                if (cached) return { ...cached };
                 const group = self.requireServices().group;
-                const res = await group.getGroupDetailInfo(groupCode);
+                // kernel signature: getGroupDetailInfo(groupCode, source); KDATACARD = 2
+                const res = await group.getGroupDetailInfo(groupCode, 2);
                 const g = (res?.result ?? res) as Record<string, unknown>;
                 return {
                     group_id: String(g.groupCode ?? groupCode),
