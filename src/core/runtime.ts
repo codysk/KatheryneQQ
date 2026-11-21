@@ -305,14 +305,11 @@ class KatheryneRuntime {
                 return this.handleRecall(chatType, peerUid, msgSeq).catch(() => undefined);
             },
             onRecvMsg: (msgs: RawMessage[]) => {
-                for (const m of msgs ?? []) this.emitMessage(m, false);
+                for (const m of msgs ?? []) {
+                    this.emitMessage(m, false);
+                }
             },
             onMsgInfoListUpdate: async (msgs: RawMessage[]) => {
-                console.error('[infolist-debug]', msgs?.length, 'msgs;',
-                    JSON.stringify((msgs ?? []).map((m) => ({
-                        t: m.msgType, seq: m.msgSeq, rt: m.recallTime,
-                        els: ((m.elements ?? []) as Array<Record<string, unknown>>).map((el) => Object.keys(el).join('+')).join('|'),
-                    })))?.slice(0, 500));
                 // NapCat pattern: recalls arrive here as gray-tip updates on the
                 // ORIGINAL message (recallTime set, revokeElement attached) —
                 // regardless of msgType. Also route pure gray-tip messages.
@@ -571,11 +568,77 @@ class KatheryneRuntime {
         }
     }
 
+
+    // ---------------- OIDB packet send (poke etc.) ----------------
+
+    /**
+     * Minimal protobuf writer (varint tags, length-delimited fields) — enough
+     * for the OIDB packets the actions need (poke 0xED3_1 etc.).
+     */
+    private pbTag(field: number, wireType: number): Buffer {
+        return this.pbVarint((field << 3) | wireType);
+    }
+    private pbVarint(value: number): Buffer {
+        const out: number[] = [];
+        let v = value >>> 0;
+        while (v > 0x7f) { out.push((v & 0x7f) | 0x80); v >>>= 7; }
+        out.push(v & 0x7f);
+        return Buffer.from(out);
+    }
+    private pbUint(field: number, value: number): Buffer {
+        return Buffer.concat([this.pbTag(field, 0), this.pbVarint(value)]);
+    }
+    private pbBytes(field: number, data: Buffer): Buffer {
+        return Buffer.concat([this.pbTag(field, 2), this.pbVarint(data.length), data]);
+    }
+
+    /** Build OidbSvcTrpcTcpBase packet: {command, subCommand, body, isReserved} */
+    private buildOidb(cmd: number, subCmd: number, body: Buffer): Buffer {
+        return Buffer.concat([
+            this.pbUint(1, cmd),
+            this.pbUint(2, subCmd),
+            this.pbBytes(4, body),
+            this.pbUint(12, 1), // isReserved (uid mode)
+        ]);
+    }
+
+    /** Build SendPoke body (0xED3_1): {uin: target, groupUin|friendUin: peer, ext: 0} */
+    private buildPokeBody(targetUin: number, peerUin: number, isGroup: boolean): Buffer {
+        const parts = [this.pbUint(1, targetUin)];
+        parts.push(isGroup ? this.pbUint(2, peerUin) : this.pbUint(5, peerUin));
+        return Buffer.concat(parts);
+    }
+
+    /** Send a raw OIDB command through the kernel MSF channel. */
+    private async sendOidb(cmd: number, subCmd: number, body: Buffer): Promise<Record<string, unknown> | null> {
+        const msgService = this.services?.msg as any;
+        if (!msgService?.sendSsoCmdReqByContend) {
+            return null;
+        }
+        const packet = this.buildOidb(cmd, subCmd, body);
+        const full = `OidbSvcTrpcTcp.0x${cmd.toString(16).toUpperCase()}_${subCmd}`;
+        try {
+            const ret = await Promise.race([
+                msgService.sendSsoCmdReqByContend(full, packet),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('oidb timeout')), 8000)),
+            ]) as { rspbuffer?: Buffer } | undefined;
+            return ret ?? null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /** Poke a user in a group or privately (OIDB 0xED3_1). */
+    private async sendPoke(targetUin: number, peerUin: number, isGroup: boolean): Promise<boolean> {
+        const body = this.buildPokeBody(targetUin, peerUin, isGroup);
+        const ret = await this.sendOidb(0xED3, 1, body);
+        return ret !== null;
+    }
+
     // ---------------- message -> OB11 ----------------
 
     private emitMessage(m: RawMessage, sent: boolean): void {
         try {
-            console.error('[msg-peer-debug] peerUid=', String(m.peerUid ?? ''), 'chatType=', Number(m.chatType ?? 0), 'peerUin=', String(m.peerUin ?? ''));
             // Harvest uid<->uin pairs from every message (covers friends and strangers).
             const senderUid = String(m.senderUid ?? '');
             const senderUin = String(m.senderUin ?? '');
@@ -583,8 +646,10 @@ class KatheryneRuntime {
                 this.uidToUin.set(senderUid, senderUin);
                 this.uinToUid.set(senderUin, senderUid);
             }
-            // Gray-tip messages (msgType 9) carry recall/poke/etc. notices, not chat.
-            if (Number((m as Record<string, unknown>).msgType ?? 0) === 9) {
+            // Gray-tip messages (msgType 9 in NapCat; 17 observed on this kernel)
+            // carry recall/poke/etc. notices, not chat.
+            const msgType = Number((m as Record<string, unknown>).msgType ?? 0);
+            if (msgType === 9 || msgType === 17) {
                 this.emitGrayTip(m);
                 return;
             }
@@ -801,7 +866,6 @@ class KatheryneRuntime {
                 const svc = self.requireServices().msg;
                 // kernel: recallMsg(peer, msgIds[]) — log raw return for diagnosis
                 const r = await svc.recallMsg(peer, [msgId]);
-                console.error('[recall-call-debug]', JSON.stringify({ peer, msgId, r: r?.result ?? r }));
             },
             async getMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
@@ -1033,6 +1097,9 @@ class KatheryneRuntime {
                 const group = self.requireServices().group;
                 // operateType: 1 accept, 2 reject (NTGroupRequestOperateTypes)
                 await group.handleGroupRequest(false, { seqId: flag } as never, accept ? 1 : 2, reason ?? '');
+            },
+            async sendPoke(targetUin, peerUin, isGroup) {
+                return await self.sendPoke(Number(targetUin), Number(peerUin), isGroup);
             },
             async getCookies(_domain) {
                 const misc = self.requireServices().misc;
