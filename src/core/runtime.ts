@@ -616,7 +616,7 @@ class KatheryneRuntime {
             this.pbUint(1, cmd),
             this.pbUint(2, subCmd),
             this.pbBytes(4, body),
-            this.pbUint(12, 1), // isReserved (uid mode)
+            this.pbUint(12, 1), // isReserved (uid mode, NapCat pattern)
         ];
         if (withServiceType) parts.push(this.pbUint(15, 0)); // ServiceType (Lagrange-compatible)
         return Buffer.concat(parts);
@@ -626,7 +626,7 @@ class KatheryneRuntime {
     private buildPokeBody(targetUin: number, peerUin: number, isGroup: boolean): Buffer {
         const parts = [this.pbUint(1, targetUin)];
         parts.push(isGroup ? this.pbUint(2, peerUin) : this.pbUint(5, peerUin));
-        parts.push(this.pbUint(6, 0)); // ext: 0 (NapCat sets this explicitly)
+        parts.push(this.pbUint(6, 0)); // ext: 0
         return Buffer.concat(parts);
     }
 
