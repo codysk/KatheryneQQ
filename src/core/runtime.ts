@@ -642,7 +642,10 @@ class KatheryneRuntime {
             // Kernel NAPI coerce_to_string()s the param — pass a safe
             // string form. Try hex first (matches NapCat's packet representation).
             const ret = await Promise.race([
-                msgService.sendSsoCmdReqByContend(full, packet),
+                // The kernel coerces the param via napi_coerce_to_string which calls
+// Buffer.toString() (utf8). Binary data with invalid UTF-8 sequences gets
+// corrupted. Fix: encode as latin1 string (byte-preserving in JS strings).
+msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 new Promise((_, rej) => setTimeout(() => rej(new Error('oidb timeout')), 8000)),
             ]) as { rspbuffer?: Buffer } | undefined;
             if (ret && typeof (ret as Record<string, unknown>).result === 'number'
