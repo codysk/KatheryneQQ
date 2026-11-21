@@ -77,6 +77,7 @@ class KatheryneRuntime {
     private loginError: string | null = null;
     private qrcodeDataUrl: string | null = null;
     private readonly startedAt = Date.now();
+    private readonly bootTimeSec = Math.floor(Date.now() / 1000);
     private config: KatheryneConfig = loadConfig();
     private consoleMgr: WebConsole | null = null;
     private network: NetworkManager | null = null;
@@ -299,20 +300,32 @@ class KatheryneRuntime {
         if (!msgService) return;
         msgService.addKernelMsgListener(listenerProxy({
             onMsgRecall: (chatType: number, peerUid: string, msgSeq: string) => {
-                this.handleRecall(chatType, peerUid, msgSeq).catch(() => undefined);
+                return this.handleRecall(chatType, peerUid, msgSeq).catch(() => undefined);
             },
             onRecvMsg: (msgs: RawMessage[]) => {
                 for (const m of msgs ?? []) this.emitMessage(m, false);
             },
-            onMsgInfoListUpdate: (msgs: RawMessage[]) => {
-                // Msg-info updates carry gray tips (recalls, pokes) that never
-                // reach onRecvMsg. Route them through the same pipeline.
+            onMsgInfoListUpdate: async (msgs: RawMessage[]) => {
+                console.error('[infolist-debug]', msgs?.length, 'msgs;',
+                    JSON.stringify((msgs ?? []).map((m) => ({
+                        t: m.msgType, seq: m.msgSeq, rt: m.recallTime,
+                        els: ((m.elements ?? []) as Array<Record<string, unknown>>).map((el) => Object.keys(el).join('+')).join('|'),
+                    })))?.slice(0, 500));
+                // NapCat pattern: recalls arrive here as gray-tip updates on the
+                // ORIGINAL message (recallTime set, revokeElement attached) —
+                // regardless of msgType. Also route pure gray-tip messages.
                 for (const m of msgs ?? []) {
-                    const msgType = Number((m as Record<string, unknown>).msgType ?? 0);
-                    if (msgType === 9) this.emitGrayTip(m);
-                    else if (Number((m as Record<string, unknown>).sendStatus ?? 0) === 3) {
-                        // sent-message updates; skip chat re-emit
+                    const els = (m.elements ?? []) as Array<Record<string, any>>;
+                    const revokeEl = els.find((el) => el.grayTipElement?.revokeElement);
+                    if (revokeEl) {
+                        const recallTime = Number((m as Record<string, unknown>).recallTime ?? 0);
+                        const secs = recallTime > 10_000_000_000 ? recallTime / 1000 : recallTime;
+                        if (Number.isFinite(secs) && secs > this.bootTimeSec - 60) {
+                            this.emitRecallEvent(m, revokeEl.grayTipElement.revokeElement);
+                        }
+                        continue;
                     }
+                    if (Number((m as Record<string, unknown>).msgType ?? 0) === 9) this.emitGrayTip(m);
                 }
             },
             onAddSendMsg: (m: RawMessage) => this.emitMessage(m, true),
@@ -502,6 +515,31 @@ class KatheryneRuntime {
         return null;
     }
 
+
+    private reportedRecalls = new Set<string>();
+
+    /** Emit recall notice from a gray-tip update (NapCat handleRecallMessage pattern). */
+    private emitRecallEvent(m: RawMessage, revoke: Record<string, any>): void {
+        const key = String(m.msgId ?? '') + ':' + String(m.msgSeq ?? '');
+        if (this.reportedRecalls.has(key)) return;
+        this.reportedRecalls.add(key);
+        if (this.reportedRecalls.size > 500) this.reportedRecalls.clear();
+        const isGroup = Number(m.chatType ?? 0) === 2;
+        const operatorUid = String(revoke.operatorUid ?? '');
+        const operator = this.uidToUin.get(operatorUid) ?? this.resolveUidLive(operatorUid) ?? operatorUid;
+        const author = this.uidToUin.get(String(m.senderUid ?? '')) ?? String(m.senderUin ?? '');
+        this.bus.emit({
+            time: Math.floor(Date.now() / 1000),
+            self_id: this.selfUin,
+            post_type: 'notice',
+            notice_type: isGroup ? 'group_recall' : 'friend_recall',
+            group_id: isGroup ? (this.uidToUin.get(String(m.peerUid ?? '')) ?? String(m.peerUid ?? '')) : undefined,
+            user_id: author || operator,
+            operator_id: isGroup ? operator : undefined,
+            message_id: String(m.msgId ?? ''),
+        } as never);
+        this.consoleMgr?.log(`recall: ${isGroup ? 'group' : 'friend'} msg=${key}`);
+    }
 
     private emitGrayTip(m: RawMessage): void {
         try {
