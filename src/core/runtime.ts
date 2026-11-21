@@ -483,16 +483,7 @@ class KatheryneRuntime {
             const isGroup = Number(chatType) === 2;
             const selfUin = this.uidToUin.get(String(recalled.senderUid ?? '')) ?? String(recalled.senderUin ?? '');
             const operator = this.uidToUin.get(operatorUid) ?? this.resolveUidLive(operatorUid) ?? operatorUid;
-            this.bus.emit({
-                time: Math.floor(Date.now() / 1000),
-                self_id: this.selfUin,
-                post_type: 'notice',
-                notice_type: isGroup ? 'group_recall' : 'friend_recall',
-                group_id: isGroup ? (this.uidToUin.get(peerUid) ?? peerUid) : undefined,
-                user_id: selfUin || operator,
-                operator_id: isGroup ? operator : undefined,
-                message_id: String(recalled.msgId ?? ''),
-            } as never);
+            this.emitRecallEvent(recalled as RawMessage, revoke);
             this.consoleMgr?.log(`recall event: seq=${msgSeq}`);
         } catch (e) {
             console.error('[katheryne] recall handler error', e);
@@ -520,7 +511,7 @@ class KatheryneRuntime {
 
     /** Emit recall notice from a gray-tip update (NapCat handleRecallMessage pattern). */
     private emitRecallEvent(m: RawMessage, revoke: Record<string, any>): void {
-        const key = String(m.msgId ?? '') + ':' + String(m.msgSeq ?? '');
+        const key = String(m.msgId ?? '');
         if (this.reportedRecalls.has(key)) return;
         this.reportedRecalls.add(key);
         if (this.reportedRecalls.size > 500) this.reportedRecalls.clear();
@@ -555,16 +546,7 @@ class KatheryneRuntime {
                     group_id: isGroup ? (this.uidToUin.get(String(m.peerUid ?? '')) ?? String(m.peerUid ?? '')) : undefined,
                 };
                 if (gray.revokeElement) {
-                    const rv = gray.revokeElement;
-                    const operator = this.uidToUin.get(String(rv.operatorUid ?? ''))
-                        ?? this.resolveUidLive(String(rv.operatorUid ?? '')) ?? String(rv.operatorUid ?? '');
-                    this.bus.emit({
-                        ...base,
-                        notice_type: isGroup ? 'group_recall' : 'friend_recall',
-                        user_id: this.uidToUin.get(String(m.senderUid ?? '')) ?? operator,
-                        operator_id: isGroup ? operator : undefined,
-                        message_id: String(m.msgId ?? ''),
-                    } as never);
+                    this.emitRecallEvent(m, gray.revokeElement);
                 } else if (gray.jsonGrayTipElement?.jsonStr) {
                     // Poke (拍一拍): json.items = [{uid}, {uid}]
                     try {
@@ -591,6 +573,7 @@ class KatheryneRuntime {
 
     private emitMessage(m: RawMessage, sent: boolean): void {
         try {
+            console.error('[msg-peer-debug] peerUid=', String(m.peerUid ?? ''), 'chatType=', Number(m.chatType ?? 0), 'peerUin=', String(m.peerUin ?? ''));
             // Harvest uid<->uin pairs from every message (covers friends and strangers).
             const senderUid = String(m.senderUid ?? '');
             const senderUin = String(m.senderUin ?? '');
@@ -785,13 +768,32 @@ class KatheryneRuntime {
                     msgId = String(Date.now());
                 }
                 const peerWithId = { ...peer, guildId: msgId };
+                // The kernel-assigned msgId arrives via onAddSendMsg; capture it.
+                const realId = new Promise<string>((resolve) => {
+                    const listener = {
+                        onAddSendMsg: (m: Record<string, unknown>) => {
+                            // match by our generated id (kernel echoes it in guildId field)
+                            const rec = JSON.stringify(m);
+                            if (rec.includes(msgId)) {
+                                resolve(String(m.msgId ?? ''));
+                                svc.removeKernelMsgListener?.(listener as never);
+                            }
+                        },
+                    };
+                    try {
+                        svc.addKernelMsgListener(listener);
+                    } catch { /* ignore */ }
+                    setTimeout(() => resolve(''), 8000);
+                });
                 const r = await svc.sendMsg('0', peerWithId, elements, new Map());
-                return { msgId: String(r?.result?.msgId ?? msgId) };
+                const real = await realId;
+                return { msgId: real || String(r?.result?.msgId ?? msgId) };
             },
             async deleteMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
-                // kernel: recallMsg(peer, msgIds[])
-                await svc.recallMsg(peer, [msgId]);
+                // kernel: recallMsg(peer, msgIds[]) — log raw return for diagnosis
+                const r = await svc.recallMsg(peer, [msgId]);
+                console.error('[recall-call-debug]', JSON.stringify({ peer, msgId, r: r?.result ?? r }));
             },
             async getMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
