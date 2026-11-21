@@ -353,23 +353,49 @@ class KatheryneRuntime {
         try {
             const buddy = this.services?.buddy;
             if (!buddy) return;
-            let infos: Array<Record<string, unknown>> = [];
+            // getBuddyListV2 returns categories: [{ buddyUids: [...] }].
+            // Resolve uins via profile service per uid (kernel-side mapping).
+            const uids: string[] = [];
             try {
-                const res = await buddy.getBuddyListV2('0', true, 1); // BuddyListReqType.KNOMAL = 1
-                infos = res?.data?.buddyList ?? [];
-            } catch {
-                const res = await buddy.getBuddyList('BuddyList', true, false, false, false, false, 0);
-                infos = res?.result?.buddyList ?? res?.buddyList ?? [];
+                const res = await buddy.getBuddyListV2('0', true, 0); // BuddyListReqType.KNOMAL
+                const cats = res?.data ?? [];
+                for (const cat of cats) {
+                    for (const u of cat.buddyUids ?? []) uids.push(String(u));
+                }
+            } catch { /* fall through to legacy */ }
+            if (uids.length === 0) {
+                try {
+                    const res = await buddy.getBuddyList('BuddyList', true, false, false, false, false, 0);
+                    const flat = res?.result?.buddyList ?? res?.buddyList ?? [];
+                    for (const f of flat) {
+                        const uid = String(f.uid ?? '');
+                        const uin = String(f.uin ?? '');
+                        if (uid && uin) {
+                            this.uinToUid.set(uin, uid);
+                            this.uidToUin.set(uid, uin);
+                        }
+                    }
+                } catch { /* empty list kept */ }
             }
-            for (const f of infos) {
-                const uid = String(f.uid ?? '');
-                const uin = String(f.uin ?? '');
-                if (uid && uin) {
-                    this.uinToUid.set(uin, uid);
-                    this.uidToUin.set(uid, uin);
+            if (uids.length > 0) {
+                const profile = this.services?.profile;
+                if (profile) {
+                    try {
+                        const res = await profile.getCoreAndBaseInfo('nodeStore', uids);
+                        console.log('[katheryne] getCoreAndBaseInfo raw keys:', JSON.stringify(Object.keys(res ?? {})), 'sample:', JSON.stringify(res).slice(0, 400));
+                        const infos = res?.result?.info ?? res?.info ?? [];
+                        for (const f of infos) {
+                            const uid = String(f.uid ?? '');
+                            const uin = String(f.uin ?? '');
+                            if (uid && uin && uin !== '0') {
+                                this.uinToUid.set(uin, uid);
+                                this.uidToUin.set(uid, uin);
+                            }
+                        }
+                    } catch { /* kernel refused bulk fetch */ }
                 }
             }
-            console.log(`[katheryne] cached ${this.uinToUid.size} friend uid mappings`);
+            console.log(`[katheryne] cached ${this.uinToUid.size}/${uids.length || '?'} friend uid mappings`);
         } catch {
             // partial mapping; per-call resolution still works via kernel
         }
@@ -379,6 +405,13 @@ class KatheryneRuntime {
 
     private emitMessage(m: RawMessage, sent: boolean): void {
         try {
+            // Harvest uid<->uin pairs from every message (covers friends and strangers).
+            const senderUid = String(m.senderUid ?? '');
+            const senderUin = String(m.senderUin ?? '');
+            if (senderUid && senderUin && senderUin !== '0') {
+                this.uidToUin.set(senderUid, senderUin);
+                this.uinToUid.set(senderUin, senderUid);
+            }
             const chatType = Number(m.chatType ?? 0);
             const isGroup = chatType === 2;
             const peerUid = String(m.peerUid ?? '');
@@ -430,16 +463,59 @@ class KatheryneRuntime {
             },
             resolveUin(uin: string): string | null {
                 if (uin === self.selfUin) return self.selfUid;
-                return self.uinToUid.get(uin) ?? null;
+                const cached = self.uinToUid.get(uin);
+                if (cached) return cached;
+                // Live kernel conversion fallback (uix service).
+                try {
+                    const uix = self.services?.uix;
+                    if (uix) {
+                        const r = Promise.resolve(uix.getUid([uin])).then((rr: Record<string, any>) => {
+                            const uidInfo = rr?.uidInfo;
+                            const uid = uidInfo?.get?.(uin) ?? uidInfo?.[uin]
+                                ?? rr?.result?.uidInfo?.get?.(uin);
+                            if (uid && !String(uid).includes('*')) {
+                                self.uinToUid.set(uin, String(uid));
+                                self.uidToUin.set(String(uid), uin);
+                            }
+                        }).catch(() => undefined);
+                    }
+                } catch { /* fallthrough */ }
+                return null;
             },
             resolveUid(uid: string): string | null {
                 if (uid === self.selfUid) return self.selfUin;
-                return self.uidToUin.get(uid) ?? null;
+                const cached = self.uidToUin.get(uid);
+                if (cached) return cached;
+                try {
+                    const uix = self.services?.uix;
+                    if (uix) {
+                        const r = uix.getUin([uid]);
+                        const uin = r?.uinInfo?.get(uid) ?? r?.result?.uinInfo?.get(uid);
+                        if (uin && String(uin) !== '0') {
+                            self.uidToUin.set(uid, String(uin));
+                            self.uinToUid.set(String(uin), uid);
+                            return String(uin);
+                        }
+                    }
+                } catch { /* fallthrough */ }
+                return null;
             },
             async sendMessage(peer, elements) {
                 const svc = self.requireServices().msg;
-                const r = await svc.sendMsg(peer, elements);
-                return { msgId: String(r?.result?.msgId ?? r?.msgId ?? '') };
+                // Kernel sendMsg signature (mirrors official client):
+                //   sendMsg('0', peer, elements, attrMap)
+                // and peer.guildId must carry a generated unique msg id.
+                let msgId = '';
+                try {
+                    const msf = self.requireServices().msf;
+                    const serverTime = msf.getServerTime();
+                    msgId = String(await svc.generateMsgUniqueId(peer.chatType, serverTime));
+                } catch {
+                    msgId = String(Date.now());
+                }
+                const peerWithId = { ...peer, guildId: msgId };
+                const r = await svc.sendMsg('0', peerWithId, elements, new Map());
+                return { msgId: String(r?.result?.msgId ?? msgId) };
             },
             async deleteMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
@@ -541,15 +617,42 @@ class KatheryneRuntime {
             },
             async getGroupMemberList(groupCode) {
                 const group = self.requireServices().group;
-                const res = await group.getAllMemberList(groupCode, false);
-                const infos = res?.result?.memberList ?? res?.memberList ?? res?.result?.groupMemberList ?? [];
-                return infos.map((mem: Record<string, unknown>) => ({
-                    user_id: String(mem.uin ?? ''),
-                    nickname: String(mem.nick ?? ''),
-                    card: String(mem.cardName ?? ''),
-                    role:
-                        Number(mem.role ?? 0) === 1 ? 'owner' : Number(mem.role ?? 0) === 2 ? 'admin' : Number(mem.role ?? 0) === 3 ? 'member' : 'member',
-                }));
+                const res = await group.getAllMemberList(groupCode, true);
+                const result = (res?.result ?? res ?? {}) as Record<string, unknown>;
+                // Kernel shape: result.ids = [{uid, index}], result.infos = { [uid]: {uin, nick, cardName, role, ...} }
+                const ids = (result?.ids ?? []) as Array<{ uid: string; index: number }>;
+                const infosRaw = result?.infos as unknown;
+                // infos may be a plain object OR a NAPI Map; handle both.
+                const infosGet = (uid: string): Record<string, unknown> | undefined => {
+                    if (!infosRaw) return undefined;
+                    const asMap = infosRaw as Map<string, Record<string, unknown>>;
+                    if (typeof asMap.get === 'function') {
+                        const direct = asMap.get(uid);
+                        if (direct) return direct;
+                    }
+                    return (infosRaw as Record<string, Record<string, unknown>>)[uid];
+                };
+                let harvested = 0;
+                for (const { uid } of ids) {
+                    const info = infosGet(uid) ?? {};
+                    const uin = String(info.uin ?? '');
+                    if (uid && uin && uin !== '0') {
+                        self.uidToUin.set(uid, uin);
+                        self.uinToUid.set(uin, uid);
+                        harvested++;
+                    }
+                }
+                console.error(`[members-harvest] ids=${ids.length} harvested=${harvested} sample=`, JSON.stringify(infosGet(ids[0]?.uid ?? ''))?.slice(0, 300));
+                return ids.map(({ uid }) => {
+                    const info = infosGet(uid) ?? {};
+                    const roleNum = Number(info.role ?? 0);
+                    return {
+                        user_id: String(info.uin ?? self.uidToUin.get(uid) ?? ''),
+                        nickname: String(info.nick ?? ''),
+                        card: String(info.cardName ?? ''),
+                        role: roleNum === 1 ? 'owner' : roleNum === 2 ? 'admin' : 'member',
+                    };
+                });
             },
             async getGroupMemberInfo(groupCode, memberUid) {
                 const group = self.requireServices().group;

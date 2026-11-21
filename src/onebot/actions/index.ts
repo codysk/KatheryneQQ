@@ -94,9 +94,9 @@ function peerOf(params: ActionParams, ctx: ActionContext, opts: { requireGroup?:
     const messageType = params.message_type as string | undefined;
 
     if (messageType === 'group' || (groupId && messageType === undefined)) {
-        const uid = ctx.resolveUin(String(groupId ?? ''));
-        if (!uid) throw new ActionError(1400, `cannot resolve group ${groupId} to uid`);
-        return { chatType: 2, peerUid: uid };
+        // NT group peers are addressed by the group code (uin) directly;
+        // no uid resolution needed for groups.
+        return { chatType: 2, peerUid: String(groupId ?? '') };
     }
     if (messageType === 'private' || messageType === undefined) {
         if (opts.requireGroup) throw new ActionError(1400, 'group_id required');
