@@ -214,11 +214,16 @@ export function ntElementsToSegments(
             }
             case ELEMENT_TYPE.PIC: {
                 const pe = (el.picElement ?? {}) as Record<string, unknown>;
+                // originImageUrl is the relative CDN path; prefix the host.
+                const origin = String(pe.originImageUrl ?? '');
+                const url = origin
+                    ? (origin.startsWith('http') ? origin : `https://gchat.qpic.cn${origin}`)
+                    : String(pe.picSubUrl ?? pe.url ?? '');
                 out.push({
                     type: 'image',
                     data: {
                         file: String(pe.fileName ?? pe.md5HexStr ?? ''),
-                        url: String(pe.picSubUrl ?? pe.url ?? ''),
+                        url,
                         file_size: Number(pe.fileSize ?? 0),
                     },
                 });

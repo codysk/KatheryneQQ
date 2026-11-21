@@ -5,3 +5,4 @@ work/
 .DS_Store
 config.json
 qr_current.png
+tools/

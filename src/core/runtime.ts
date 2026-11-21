@@ -7,6 +7,25 @@
  * once the kernel reports a logged-in state.
  */
 import fs from 'node:fs';
+
+/**
+ * Kernel listeners are invoked by method name; any method missing on the
+ * registered object can break the whole callback dispatch. Mirror NapCat's
+ * proxiedListenerOf: a Proxy returning no-op functions for unknown methods.
+ */
+function listenerProxy<T extends object>(listener: T): T {
+    return new Proxy(listener, {
+        get(target, prop: string | symbol, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (typeof value === 'undefined') {
+                // Kernel validates the return value of every listener call;
+                // resolve with a Promise so the napi check passes.
+                return (..._args: unknown[]) => Promise.resolve();
+            }
+            return value;
+        },
+    });
+}
 import path from 'node:path';
 import os from 'node:os';
 import { loadKernelFromQQ, type LoadedKernel } from '../nt/loader.js';
@@ -278,9 +297,23 @@ class KatheryneRuntime {
     private attachMsgListener(): void {
         const msgService = this.services?.msg;
         if (!msgService) return;
-        msgService.addKernelMsgListener({
+        msgService.addKernelMsgListener(listenerProxy({
+            onMsgRecall: (chatType: number, peerUid: string, msgSeq: string) => {
+                this.handleRecall(chatType, peerUid, msgSeq).catch(() => undefined);
+            },
             onRecvMsg: (msgs: RawMessage[]) => {
                 for (const m of msgs ?? []) this.emitMessage(m, false);
+            },
+            onMsgInfoListUpdate: (msgs: RawMessage[]) => {
+                // Msg-info updates carry gray tips (recalls, pokes) that never
+                // reach onRecvMsg. Route them through the same pipeline.
+                for (const m of msgs ?? []) {
+                    const msgType = Number((m as Record<string, unknown>).msgType ?? 0);
+                    if (msgType === 9) this.emitGrayTip(m);
+                    else if (Number((m as Record<string, unknown>).sendStatus ?? 0) === 3) {
+                        // sent-message updates; skip chat re-emit
+                    }
+                }
             },
             onAddSendMsg: (m: RawMessage) => this.emitMessage(m, true),
             onRecvMsgSvrRspTransInfo: () => undefined,
@@ -296,7 +329,7 @@ class KatheryneRuntime {
                     desc: info?.tipsDesc ?? '',
                 });
             },
-        });
+        }));
         try {
             msgService.startMsgSync();
         } catch {
@@ -311,7 +344,7 @@ class KatheryneRuntime {
     private attachGroupListener(): void {
         const groupService = this.services?.group;
         if (!groupService) return;
-        groupService.addKernelGroupListener({
+        groupService.addKernelGroupListener(listenerProxy({
             onGroupListUpdate: (_updateType: unknown, groupList: Array<Record<string, unknown>>) => {
                 for (const g of groupList ?? []) {
                     const code = String(g.groupCode ?? '');
@@ -335,13 +368,13 @@ class KatheryneRuntime {
                     if (ev) this.bus.emit(ev);
                 }
             },
-        });
+        }));
     }
 
     private attachBuddyListener(): void {
         const buddyService = this.services?.buddy;
         if (!buddyService) return;
-        buddyService.addKernelBuddyListener({
+        buddyService.addKernelBuddyListener(listenerProxy({
             onBuddyReqChange: (arg: Record<string, unknown>) => {
                 const reqs = (arg?.reqList ?? arg?.newList ?? []) as Array<Record<string, unknown>>;
                 for (const r of reqs) {
@@ -358,7 +391,7 @@ class KatheryneRuntime {
                     });
                 }
             },
-        });
+        }));
     }
 
     private async cacheMappings(): Promise<void> {
@@ -413,6 +446,109 @@ class KatheryneRuntime {
         }
     }
 
+
+    private async handleRecall(chatType: number, peerUid: string, msgSeq: string): Promise<void> {
+        try {
+            const svc = this.services?.msg;
+            if (!svc) return;
+            const peer = { chatType, peerUid, guildId: '' };
+            const r = await svc.getMsgsIncludeSelf(peer, '', 20, false);
+            const list = (r?.result?.msgList ?? r?.msgList ?? []) as Array<Record<string, unknown>>;
+            const recalled = list.find((m) => {
+                const els = (m.elements ?? []) as Array<Record<string, unknown>>;
+                return String(m.msgSeq ?? '') === String(msgSeq)
+                    && els.some((el) => {
+                        const gt = el.grayTipElement as Record<string, unknown> | undefined;
+                        return gt && gt.revokeElement;
+                    });
+            });
+            if (!recalled) return;
+            const els = (recalled.elements ?? []) as Array<Record<string, unknown>>;
+            const gray = (els.find((el) => (el.grayTipElement as Record<string, unknown>)?.revokeElement)?.grayTipElement ?? {}) as Record<string, any>;
+            const revoke = gray.revokeElement ?? {};
+            const operatorUid = String(revoke.operatorUid ?? '');
+            const isGroup = Number(chatType) === 2;
+            const selfUin = this.uidToUin.get(String(recalled.senderUid ?? '')) ?? String(recalled.senderUin ?? '');
+            const operator = this.uidToUin.get(operatorUid) ?? this.resolveUidLive(operatorUid) ?? operatorUid;
+            this.bus.emit({
+                time: Math.floor(Date.now() / 1000),
+                self_id: this.selfUin,
+                post_type: 'notice',
+                notice_type: isGroup ? 'group_recall' : 'friend_recall',
+                group_id: isGroup ? (this.uidToUin.get(peerUid) ?? peerUid) : undefined,
+                user_id: selfUin || operator,
+                operator_id: isGroup ? operator : undefined,
+                message_id: String(recalled.msgId ?? ''),
+            } as never);
+            this.consoleMgr?.log(`recall event: seq=${msgSeq}`);
+        } catch (e) {
+            console.error('[katheryne] recall handler error', e);
+        }
+    }
+
+    /** Live uid->uin via uix service, cached on success. */
+    private resolveUidLive(uid: string): string | null {
+        try {
+            const uix = this.services?.uix as any;
+            if (!uix) return null;
+            const r = uix.getUin([uid]);
+            const uin = r?.uinInfo?.get?.(uid) ?? r?.result?.uinInfo?.get?.(uid);
+            if (uin && String(uin) !== '0') {
+                this.uidToUin.set(uid, String(uin));
+                this.uinToUid.set(String(uin), uid);
+                return String(uin);
+            }
+        } catch { /* ignore */ }
+        return null;
+    }
+
+
+    private emitGrayTip(m: RawMessage): void {
+        try {
+            const els = (m.elements ?? []) as Array<Record<string, any>>;
+            for (const el of els) {
+                const gray = el.grayTipElement;
+                if (!gray) continue;
+                const isGroup = Number(m.chatType ?? 0) === 2;
+                const base = {
+                    time: Math.floor(Date.now() / 1000),
+                    self_id: this.selfUin,
+                    post_type: 'notice' as const,
+                    group_id: isGroup ? (this.uidToUin.get(String(m.peerUid ?? '')) ?? String(m.peerUid ?? '')) : undefined,
+                };
+                if (gray.revokeElement) {
+                    const rv = gray.revokeElement;
+                    const operator = this.uidToUin.get(String(rv.operatorUid ?? ''))
+                        ?? this.resolveUidLive(String(rv.operatorUid ?? '')) ?? String(rv.operatorUid ?? '');
+                    this.bus.emit({
+                        ...base,
+                        notice_type: isGroup ? 'group_recall' : 'friend_recall',
+                        user_id: this.uidToUin.get(String(m.senderUid ?? '')) ?? operator,
+                        operator_id: isGroup ? operator : undefined,
+                        message_id: String(m.msgId ?? ''),
+                    } as never);
+                } else if (gray.jsonGrayTipElement?.jsonStr) {
+                    // Poke (拍一拍): json.items = [{uid}, {uid}]
+                    try {
+                        const json = JSON.parse(gray.jsonGrayTipElement.jsonStr);
+                        const uids = (json.items ?? []).filter((it: { uid?: string }) => it.uid).map((it: { uid: string }) => it.uid);
+                        if (uids.length === 2) {
+                            const [fromUid, toUid] = uids;
+                            this.bus.emit({
+                                ...base,
+                                notice_type: 'poke',
+                                user_id: this.uidToUin.get(fromUid) ?? this.resolveUidLive(fromUid) ?? fromUid,
+                                target_id: this.uidToUin.get(toUid) ?? this.resolveUidLive(toUid) ?? toUid,
+                            } as never);
+                        }
+                    } catch { /* not a poke json */ }
+                }
+            }
+        } catch (e) {
+            console.error('[katheryne] gray tip error', e);
+        }
+    }
+
     // ---------------- message -> OB11 ----------------
 
     private emitMessage(m: RawMessage, sent: boolean): void {
@@ -423,6 +559,11 @@ class KatheryneRuntime {
             if (senderUid && senderUin && senderUin !== '0') {
                 this.uidToUin.set(senderUid, senderUin);
                 this.uinToUid.set(senderUin, senderUid);
+            }
+            // Gray-tip messages (msgType 9) carry recall/poke/etc. notices, not chat.
+            if (Number((m as Record<string, unknown>).msgType ?? 0) === 9) {
+                this.emitGrayTip(m);
+                return;
             }
             const chatType = Number(m.chatType ?? 0);
             const isGroup = chatType === 2;
@@ -455,6 +596,75 @@ class KatheryneRuntime {
         } catch (e) {
             console.error('[katheryne] emitMessage error', e);
         }
+    }
+
+
+    /**
+     * Prepare a local image for sending: compute md5/size, ask the kernel
+     * for the rich-media path, copy the file there (NapCat-compatible flow).
+     */
+    private async prepareImageElement(sourcePath: string): Promise<Record<string, unknown>> {
+        const crypto = await import('node:crypto');
+        const fs = await import('node:fs');
+        const path = await import('node:path');
+        const data = fs.readFileSync(sourcePath);
+        const md5 = crypto.createHash('md5').update(data).digest('hex');
+        const fileSize = data.length;
+        const fileName = path.basename(sourcePath);
+        const msgService = this.services?.msg;
+        let mediaPath = sourcePath;
+        try {
+            mediaPath = await (msgService as any).getRichMediaFilePathForGuild({
+                md5HexStr: md5,
+                fileName,
+                elementType: 2, // PIC
+                elementSubType: 0,
+                thumbSize: 0,
+                needCreate: true,
+                downloadType: 1,
+                file_uuid: '',
+            });
+            if (mediaPath && mediaPath !== sourcePath) {
+                fs.mkdirSync(path.dirname(String(mediaPath)), { recursive: true });
+                fs.copyFileSync(sourcePath, String(mediaPath));
+            }
+        } catch { /* fall back to original path */ }
+        // read PNG/JPEG dimensions
+        let width = 0, height = 0;
+        try {
+            if (data[0] === 0x89 && data[1] === 0x50) { // PNG
+                width = data.readUInt32BE(16); height = data.readUInt32BE(20);
+            } else if (data[0] === 0xFF && data[1] === 0xD8) { // JPEG
+                let off = 2;
+                while (off < data.length - 8) {
+                    if (data[off] !== 0xFF) { off++; continue; }
+                    const marker = data[off + 1];
+                    if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
+                        height = data.readUInt16BE(off + 5); width = data.readUInt16BE(off + 7); break;
+                    }
+                    off += 2 + data.readUInt16BE(off + 2);
+                }
+            }
+        } catch { /* dims unknown */ }
+        return {
+            elementType: 2,
+            elementId: '',
+            picElement: {
+                md5HexStr: md5,
+                fileSize: String(fileSize),
+                picWidth: width,
+                picHeight: height,
+                fileName,
+                sourcePath: String(mediaPath),
+                original: true,
+                picType: 0,
+                picSubType: 0,
+                fileUuid: '',
+                fileSubId: '',
+                thumbFileSize: 0,
+                summary: '',
+            },
+        };
     }
 
     // ---------------- action context ----------------
@@ -517,6 +727,17 @@ class KatheryneRuntime {
                 // Kernel sendMsg signature (mirrors official client):
                 //   sendMsg('0', peer, elements, attrMap)
                 // and peer.guildId must carry a generated unique msg id.
+                // Prepare local-file image segments before hitting the kernel.
+                for (let i = 0; i < elements.length; i++) {
+                    const el = elements[i] as Record<string, unknown>;
+                    const pic = el?.picElement as Record<string, unknown> | undefined;
+                    const src = String(pic?.sourcePath ?? '');
+                    if (el?.elementType === 2 && src && !src.includes('/') === false && src.startsWith('/')) {
+                        try {
+                            elements[i] = await self.prepareImageElement(src) as never;
+                        } catch { /* keep original element */ }
+                    }
+                }
                 let msgId = '';
                 try {
                     const msf = self.requireServices().msf;
@@ -531,7 +752,8 @@ class KatheryneRuntime {
             },
             async deleteMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
-                await svc.revokeMsg(peer, msgId);
+                // kernel: recallMsg(peer, msgIds[])
+                await svc.recallMsg(peer, [msgId]);
             },
             async getMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
@@ -592,10 +814,16 @@ class KatheryneRuntime {
                 if (uids.length > 0) {
                     try {
                         const res = await profile.getCoreAndBaseInfo('nodeStore', uids);
-                        const infoMap = (res?.result?.info ?? res?.info ?? {}) as Record<string, Record<string, unknown>>;
+                        const infoMap = (res?.result?.info ?? res?.info ?? {}) as unknown;
+                        const getInfo = (uid: string): Record<string, any> | undefined => {
+                            if (!infoMap) return undefined;
+                            const m = infoMap as Map<string, Record<string, any>>;
+                            if (typeof m.get === 'function') return m.get(uid);
+                            return (infoMap as Record<string, Record<string, any>>)[uid];
+                        };
                         for (const uid of uids) {
-                            const info = (infoMap[uid] ?? {}) as Record<string, any>;
-                            const core = info.coreInfo ?? {};
+                            const info = getInfo(uid) ?? {};
+                            const core = (info.coreInfo ?? {}) as Record<string, unknown>;
                             const uin = String(core.uin ?? info.uin ?? '');
                             if (uin && uin !== '0') {
                                 self.uidToUin.set(uid, uin);
