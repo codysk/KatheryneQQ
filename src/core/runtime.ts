@@ -324,7 +324,7 @@ class KatheryneRuntime {
                         }
                         continue;
                     }
-                    if (Number((m as Record<string, unknown>).msgType ?? 0) === 9) this.emitGrayTip(m);
+                    if (Number((m as Record<string, unknown>).msgType ?? 0) === 5) void this.emitGrayTip(m);
                 }
             },
             onAddSendMsg: (m: RawMessage) => this.emitMessage(m, true),
@@ -531,7 +531,7 @@ class KatheryneRuntime {
         this.consoleMgr?.log(`recall: ${isGroup ? 'group' : 'friend'} msg=${key}`);
     }
 
-    private emitGrayTip(m: RawMessage): void {
+    private async emitGrayTip(m: RawMessage): Promise<void> {
         try {
             const els = (m.elements ?? []) as Array<Record<string, any>>;
             for (const el of els) {
@@ -553,11 +553,29 @@ class KatheryneRuntime {
                         const uids = (json.items ?? []).filter((it: { uid?: string }) => it.uid).map((it: { uid: string }) => it.uid);
                         if (uids.length === 2) {
                             const [fromUid, toUid] = uids;
+                            // Resolve NT uids -> QQ uins via profile batch lookup.
+                            let fromUin = this.uidToUin.get(fromUid) ?? '';
+                            let toUin = this.uidToUin.get(toUid) ?? '';
+                            try {
+                                const profile = this.services?.profile;
+                                if (profile && (!fromUin || !toUin)) {
+                                    const res = await profile.getUserSimpleInfo?.(false, uids);
+                                    const infoMap = (res?.result?.info ?? res?.info ?? {}) as unknown;
+                                    const getUin = (uid: string): string => {
+                                        if (!infoMap) return '';
+                                        const mm = infoMap as Map<string, Record<string, any>>;
+                                        const info = typeof mm.get === 'function' ? mm.get(uid) : (infoMap as Record<string, Record<string, any>>)[uid];
+                                        return String(info?.coreInfo?.uin ?? info?.uin ?? '').replace(/^0+$/, '');
+                                    };
+                                    fromUin = fromUin || getUin(fromUid);
+                                    toUin = toUin || getUin(toUid);
+                                }
+                            } catch { /* fall back to uid */ }
                             this.bus.emit({
                                 ...base,
                                 notice_type: 'poke',
-                                user_id: this.uidToUin.get(fromUid) ?? this.resolveUidLive(fromUid) ?? fromUid,
-                                target_id: this.uidToUin.get(toUid) ?? this.resolveUidLive(toUid) ?? toUid,
+                                user_id: fromUin || fromUid,
+                                target_id: toUin || toUid,
                             } as never);
                         }
                     } catch { /* not a poke json */ }
@@ -649,8 +667,9 @@ class KatheryneRuntime {
             // Gray-tip messages (msgType 9 in NapCat; 17 observed on this kernel)
             // carry recall/poke/etc. notices, not chat.
             const msgType = Number((m as Record<string, unknown>).msgType ?? 0);
-            if (msgType === 9 || msgType === 17) {
-                this.emitGrayTip(m);
+            // KMSGTYPEGRAYTIPS = 5 (NapCat NTMsgType). 9 is REPLY, not gray tip!
+            if (msgType === 5) {
+                void this.emitGrayTip(m);
                 return;
             }
             const chatType = Number(m.chatType ?? 0);
