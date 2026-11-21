@@ -19,6 +19,7 @@ export interface ActionContext {
     selfUid: string;
     resolveUin(uin: string): string | null;
     resolveUid(uid: string): string | null;
+    resolveMsgPeer(msgId: string): { chatType: number; peerUid: string } | null;
     // messaging
     sendMessage(peer: PeerRef, elements: unknown[]): Promise<{ msgId: string; seq?: string }>;
     deleteMsg(peer: PeerRef, msgId: string): Promise<void>;
@@ -129,10 +130,16 @@ const actions: Record<string, ActionHandler> = {
         return { message_id: r.msgId };
     },
     delete_msg: async (p, ctx) => {
-        await ctx.deleteMsg(peerOf(p, ctx), str(p, 'message_id'));
+        const mid = str(p, 'message_id');
+        const peer = (p.user_id || p.group_id) ? peerOf(p, ctx) : (ctx.resolveMsgPeer(mid) ?? peerOf(p, ctx));
+        await ctx.deleteMsg(peer, mid);
         return {};
     },
-    get_msg: async (p, ctx) => await ctx.getMsg(peerOf(p, ctx), str(p, 'message_id')),
+    get_msg: async (p, ctx) => {
+        const mid = str(p, 'message_id');
+        const peer = (p.user_id || p.group_id) ? peerOf(p, ctx) : (ctx.resolveMsgPeer(mid) ?? peerOf(p, ctx));
+        return await ctx.getMsg(peer, mid);
+    },
     get_msg_history: async (p, ctx) => {
         const list = await ctx.getMsgHistory(peerOf(p, ctx), String(p.message_id ?? ''), num(p, 'count', 20));
         return { messages: list };

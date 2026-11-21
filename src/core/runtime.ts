@@ -83,6 +83,8 @@ class KatheryneRuntime {
     private network: NetworkManager | null = null;
     private uinToUid = new Map<string, string>();
     private uidToUin = new Map<string, string>();
+    /** msgId -> peer, harvested from every message; enables message_id-only actions. */
+    private msgPeerCache = new Map<string, { chatType: number; peerUid: string; senderUid?: string; senderUin?: string; msgSeq?: string }>();
     private groupListCache = new Map<string, Record<string, unknown>>();
 
     async start(): Promise<void> {
@@ -725,6 +727,9 @@ class KatheryneRuntime {
                 } catch { /* fallthrough */ }
                 return null;
             },
+            resolveMsgPeer(msgId: string): { chatType: number; peerUid: string } | null {
+                return self.msgPeerCache.get(msgId) ?? null;
+            },
             resolveUid(uid: string): string | null {
                 if (uid === self.selfUid) return self.selfUin;
                 const cached = self.uidToUin.get(uid);
@@ -787,7 +792,10 @@ class KatheryneRuntime {
                 });
                 const r = await svc.sendMsg('0', peerWithId, elements, new Map());
                 const real = await realId;
-                return { msgId: real || String(r?.result?.msgId ?? msgId) };
+                const finalId = real || String(r?.result?.msgId ?? msgId);
+                // cache for message_id-only actions (recall/get_msg)
+                self.msgPeerCache.set(finalId, { chatType: peer.chatType, peerUid: peer.peerUid });
+                return { msgId: finalId };
             },
             async deleteMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
