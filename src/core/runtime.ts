@@ -663,9 +663,20 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
     /** Poke a user in a group or privately (OIDB 0xED3_1). */
     private async sendPoke(targetUin: number, peerUin: number, isGroup: boolean): Promise<boolean> {
         const body = this.buildPokeBody(targetUin, peerUin, isGroup);
-        const withST = process.env.KATHERYNE_ST === '1';
-        const ret = await this.sendOidb(0xED3, 1, body, withST);
-        return ret !== null;
+        // Fire-and-forget like NapCat's sendOidbPacket(rsp=false): the
+        // kernel's async response (even error codes) doesn't indicate
+        // whether the poke reached the recipient.
+        try {
+            const msgService = this.services?.msg as any;
+            if (!msgService?.sendSsoCmdReqByContend) return false;
+            const packet = this.buildOidb(0xED3, 1, body);
+            const full = 'OidbSvcTrpcTcp.0xED3_1';
+            void Promise.resolve(msgService.sendSsoCmdReqByContend(full, packet))
+                .catch(() => undefined);
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     // ---------------- message -> OB11 ----------------
