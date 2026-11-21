@@ -624,6 +624,7 @@ class KatheryneRuntime {
     private buildPokeBody(targetUin: number, peerUin: number, isGroup: boolean): Buffer {
         const parts = [this.pbUint(1, targetUin)];
         parts.push(isGroup ? this.pbUint(2, peerUin) : this.pbUint(5, peerUin));
+        parts.push(this.pbUint(6, 0)); // ext: 0 (NapCat sets this explicitly)
         return Buffer.concat(parts);
     }
 
@@ -640,6 +641,12 @@ class KatheryneRuntime {
                 msgService.sendSsoCmdReqByContend(full, packet),
                 new Promise((_, rej) => setTimeout(() => rej(new Error('oidb timeout')), 8000)),
             ]) as { rspbuffer?: Buffer } | undefined;
+            if (ret && typeof (ret as Record<string, unknown>).result === 'number'
+                && (ret as Record<string, unknown>).result !== 0) {
+                console.error('[katheryne] oidb rejected:', full,
+                    (ret as Record<string, unknown>).errMsg ?? ret);
+                return null;
+            }
             return ret ?? null;
         } catch (e) {
             return null;

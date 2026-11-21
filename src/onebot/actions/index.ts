@@ -246,7 +246,7 @@ const actions: Record<string, ActionHandler> = {
         const peerUinNum = Number(str(p, 'group_id'));
         if (!Number.isFinite(peerUinNum)) throw new ActionError(1400, 'invalid group id');
         const ok = await ctx.sendPoke(str(p, 'user_id'), String(peerUinNum), true);
-        if (!ok) throw new ActionError(1500, 'poke send failed');
+        if (!ok) throw new ActionError(1500, 'poke send failed: OIDB packet rejected by kernel (requires native packet hook)');
         return {};
     },
     friend_poke: async (p, ctx) => {
