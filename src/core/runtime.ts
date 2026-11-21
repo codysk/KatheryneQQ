@@ -611,13 +611,15 @@ class KatheryneRuntime {
     }
 
     /** Build OidbSvcTrpcTcpBase packet: {command, subCommand, body, isReserved} */
-    private buildOidb(cmd: number, subCmd: number, body: Buffer): Buffer {
-        return Buffer.concat([
+    private buildOidb(cmd: number, subCmd: number, body: Buffer, withServiceType = false): Buffer {
+        const parts = [
             this.pbUint(1, cmd),
             this.pbUint(2, subCmd),
             this.pbBytes(4, body),
             this.pbUint(12, 1), // isReserved (uid mode)
-        ]);
+        ];
+        if (withServiceType) parts.push(this.pbUint(15, 0)); // ServiceType (Lagrange-compatible)
+        return Buffer.concat(parts);
     }
 
     /** Build SendPoke body (0xED3_1): {uin: target, groupUin|friendUin: peer, ext: 0} */
@@ -629,16 +631,18 @@ class KatheryneRuntime {
     }
 
     /** Send a raw OIDB command through the kernel MSF channel. */
-    private async sendOidb(cmd: number, subCmd: number, body: Buffer): Promise<Record<string, unknown> | null> {
+    private async sendOidb(cmd: number, subCmd: number, body: Buffer, withServiceType = false): Promise<Record<string, unknown> | null> {
         const msgService = this.services?.msg as any;
         if (!msgService?.sendSsoCmdReqByContend) {
             return null;
         }
         const packet = this.buildOidb(cmd, subCmd, body);
-        const full = `OidbSvcTrpcTcp.0x${cmd.toString(16).toUpperCase()}_${subCmd}`;
+        const full = `OidbSvcTrpcTcp.0x${cmd.toString(16)}_${subCmd}`;
         try {
+            // Kernel NAPI coerce_to_string()s the param — pass a safe
+            // string form. Try hex first (matches NapCat's packet representation).
             const ret = await Promise.race([
-                msgService.sendSsoCmdReqByContend(full, packet),
+                msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 new Promise((_, rej) => setTimeout(() => rej(new Error('oidb timeout')), 8000)),
             ]) as { rspbuffer?: Buffer } | undefined;
             if (ret && typeof (ret as Record<string, unknown>).result === 'number'
@@ -656,7 +660,8 @@ class KatheryneRuntime {
     /** Poke a user in a group or privately (OIDB 0xED3_1). */
     private async sendPoke(targetUin: number, peerUin: number, isGroup: boolean): Promise<boolean> {
         const body = this.buildPokeBody(targetUin, peerUin, isGroup);
-        const ret = await this.sendOidb(0xED3, 1, body);
+        const withST = process.env.KATHERYNE_ST === '1';
+        const ret = await this.sendOidb(0xED3, 1, body, withST);
         return ret !== null;
     }
 
