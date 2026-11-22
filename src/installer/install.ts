@@ -6,29 +6,36 @@
  *   1. copies `dist/` (this runtime) into resources/app/katheryne/
  *   2. rewrites resources/app/package.json "main" to ./katheryne/boot.js
  *
+ * If no QQ installation is found, the official Linux build is downloaded
+ * automatically (version metadata from im.qq.com's linuxConfig.js, AppImage
+ * flavour) and extracted under ~/.local/share/katheryneqq/qq/.
+ * Force with `--download`; override the package URL with
+ * KATHERYNE_QQ_DOWNLOAD_URL (see src/installer/qqfetch.ts).
+ *
  * The encrypted application.asar is left untouched; QQ's own loader keeps
  * reading it, and the plaintext package.json alone decides the entry module.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { downloadQQ } from './qqfetch.js';
 
 interface InstallOptions {
     qqRoot: string; // directory containing `qq` binary (AppImage extracted root or /opt/QQ)
     source: string; // directory holding this runtime's dist output (default ../.. from this file)
 }
 
-function findQQRoot(argv: string[]): string {
-    const explicit = argv[2];
-    const candidates = explicit ? [explicit] : ['/opt/QQ', '/usr/share/qq', process.env.KATHERYNE_QQ_ROOT ?? ''];
+function findQQRoot(argv: string[]): string | null {
+    const explicit = argv.find((a) => !a.startsWith('-'));
+    const candidates = explicit
+        ? [explicit]
+        : ['/opt/QQ', '/usr/share/qq', process.env.KATHERYNE_QQ_ROOT ?? ''];
     for (const c of candidates) {
         if (!c) continue;
         const abs = path.resolve(c);
         if (fs.existsSync(path.join(abs, 'resources', 'app', 'package.json'))) return abs;
     }
-    throw new Error(
-        'QQ root not found. Extract the AppImage (./QQ.AppImage --appimage-extract) or pass the directory that contains resources/app/package.json',
-    );
+    return null;
 }
 
 function findDistRoot(): string {
@@ -77,6 +84,41 @@ function copyDir(from: string, to: string): void {
     }
 }
 
-// CLI
-const qqRoot = findQQRoot(process.argv);
-install({ qqRoot, source: findDistRoot() });
+async function main(): Promise<void> {
+    const argv = process.argv.slice(2);
+    const forceDownload = argv.includes('--download') || process.env.KATHERYNE_QQ_DOWNLOAD === '1';
+    const rootFileIdx = argv.indexOf('--root-file');
+    const rootFile = rootFileIdx >= 0 ? argv[rootFileIdx + 1] : undefined;
+
+    let qqRoot = forceDownload ? null : findQQRoot(argv);
+    if (!qqRoot) {
+        const explicit = argv.find((a) => !a.startsWith('-') && a !== rootFile);
+        if (explicit && !forceDownload) {
+            console.warn(`[katheryne] "${explicit}" is not a QQ installation (missing resources/app/package.json)`);
+        }
+        console.log('[katheryne] no QQ installation found — downloading the official Linux build');
+        const { qqRoot: downloaded, release } = await downloadQQ();
+        qqRoot = downloaded;
+        console.log(`[katheryne] QQ ${release.version} ready at ${qqRoot}`);
+    }
+
+    install({ qqRoot, source: findDistRoot() });
+
+    if (rootFile) {
+        fs.writeFileSync(rootFile, qqRoot);
+        console.log(`[katheryne] QQ root written to ${rootFile}`);
+    }
+
+    const qqBin = path.join(qqRoot, 'qq');
+    console.log('');
+    console.log('[katheryne] start with:');
+    console.log(`  KATHERYNE_CONFIG=./config.json "${qqBin}" --no-sandbox --headless`);
+    console.log('[katheryne] then open http://127.0.0.1:6099/console');
+}
+
+main().catch((e) => {
+    console.error('[katheryne] install failed:', e instanceof Error ? e.message : e);
+    console.error('[katheryne] you can download QQ for Linux manually from https://im.qq.com/linuxqq/');
+    console.error('[katheryne] extract it (./QQ*.AppImage --appimage-extract) and pass the directory to this installer.');
+    process.exit(1);
+});

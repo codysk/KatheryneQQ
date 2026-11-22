@@ -10,12 +10,20 @@ set -eu
 QQ_ROOT="${KATHERYNE_QQ_ROOT:-/qq}"
 
 if [ ! -f "$QQ_ROOT/resources/app/package.json" ]; then
-    echo "[katheryne] QQ installation not found at $QQ_ROOT" >&2
-    echo "[katheryne] extract the QQ AppImage on the host first:" >&2
-    echo "[katheryne]   ./QQ_3.2.35_x86_64.AppImage --appimage-extract" >&2
-    echo "[katheryne] then mount the extracted root:" >&2
-    echo "[katheryne]   -v \"\$PWD/squashfs-root\":/qq" >&2
-    exit 1
+    if [ "${KATHERYNE_AUTO_INSTALL:-0}" = "1" ]; then
+        echo "[katheryne] no QQ at $QQ_ROOT — downloading the official Linux build to /data"
+        node /opt/katheryne/installer/install.js --download --root-file /tmp/qqroot.txt
+        QQ_ROOT="$(cat /tmp/qqroot.txt)"
+        echo "[katheryne] using downloaded QQ at $QQ_ROOT"
+    else
+        echo "[katheryne] QQ installation not found at $QQ_ROOT" >&2
+        echo "[katheryne] extract the QQ AppImage on the host first:" >&2
+        echo "[katheryne]   ./QQ_3.2.35_x86_64.AppImage --appimage-extract" >&2
+        echo "[katheryne] then mount the extracted root:" >&2
+        echo "[katheryne]   -v \"\$PWD/squashfs-root\":/qq" >&2
+        echo "[katheryne] or set KATHERYNE_AUTO_INSTALL=1 to download it instead" >&2
+        exit 1
+    fi
 fi
 
 mkdir -p "$(dirname "${KATHERYNE_CONFIG:-/data/config.json}")" /data

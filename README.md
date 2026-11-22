@@ -59,8 +59,22 @@ QQNT Linux 版的 Electron 主进程从 `resources/app/package.json` 的 `main` 
 ```bash
 npm install
 npm run build          # tsc + 编译原生插件 → dist/
+
+# 已安装 QQ：指定 QQ 根目录
 node dist/installer/install.js /path/to/QQRoot
+
+# 未安装 QQ：安装器会自动从腾讯官方下载对应版本并解包
+# （版本元数据来自官方 linuxConfig.js，默认 AppImage，存到 ~/.local/share/katheryneqq/qq/）
+node dist/installer/install.js
+# 强制重新下载 / 指定镜像源：
+node dist/installer/install.js --download
+KATHERYNE_QQ_DOWNLOAD_URL=https://your-mirror/QQ.AppImage node dist/installer/install.js
 ```
+
+自动下载相关环境变量：`KATHERYNE_QQ_DOWNLOAD_URL`（直接覆盖安装包地址）、
+`KATHERYNE_QQ_DOWNLOAD_DIR`（缓存/解包目录）、`KATHERYNE_QQ_CONFIG_URL`
+（版本元数据地址，默认官方 `cdn-go.cn/.../rainbow/linuxConfig.js`）。
+安装完成后会打印 QQ 根目录与启动命令。
 
 ### 3. 登录
 
@@ -84,7 +98,9 @@ KATHERYNE_CONFIG=./config.json /path/to/QQRoot/qq --no-sandbox --headless
 
 ## Docker
 
-镜像**不包含 QQ 本体**（腾讯二进制不可再分发）。把宿主机解包好的 QQ 根目录挂进容器即可：
+镜像**不包含 QQ 本体**（腾讯二进制不可再分发）。两种方式：
+
+**A. 挂载宿主机已解包的 QQ（推荐）**
 
 ```bash
 # 1. 宿主机解包 QQ
@@ -107,6 +123,19 @@ docker run -d --name katheryne \
 - `/data`：`config.json`、QQ 登录记录（`HOME=/data`）、日志
 - 打开 `http://<host>:6099/console` 扫码或快速登录
 - 预构建镜像（GitHub Actions 发布）：`ghcr.io/codysk/katheryneqq:latest`
+
+**B. 容器内自动下载（无需挂载 /qq）**
+
+```bash
+docker run -d --name katheryne \
+  -p 5700:5700 -p 6700:6700 -p 6099:6099 \
+  -e KATHERYNE_AUTO_INSTALL=1 \
+  -v "$PWD/data":/data \
+  katheryneqq
+```
+
+启动时检测不到 QQ 会自动从腾讯官方下载并解包到 `/data/.local/share/katheryneqq/qq/`
+（首次启动需数分钟；后续复用同一数据卷）。
 
 ## Web 控制台
 
@@ -161,6 +190,7 @@ docker run -d --name katheryne \
 | 进程被 SIGPIPE 杀死（signal 13） | QQ 的 Bugly 崩溃处理会写已关闭的 stdout。用常驻守护进程持有日志 fd（参考 `runtime/qq_daemon.py`），或在 Docker 中运行 |
 | 快速登录不可用 | 需要先在宿主机用官方 QQ 登录一次生成记录，并把 `~/.config/QQ` 挂载/复制到运行环境 |
 | poke 返回 `cmd whitelist patch not applied` | 当前 QQ 版本与插件内 RVA 不匹配（见 `docs/poke.md` 的跨版本说明） |
+| 自动下载 QQ 返回 403 | 官方 CDN（qqdl.gtimg.cn）有区域限制，可用 `KATHERYNE_QQ_DOWNLOAD_URL` 指向可达镜像，或手动下载后把解包目录传给安装器 |
 
 ## 目录结构
 
@@ -176,7 +206,7 @@ src/
     message/segments.ts # 消息段 <-> NT 元素转换
     network/index.ts    # WS/HTTP/反向WS 传输层（零依赖）
   console/              # Web 控制台
-  installer/            # 安装/卸载器
+  installer/            # 安装/卸载器 + 官方 QQ 自动下载（qqfetch.ts）
 scripts/
   build-native.sh       # 原生插件构建
   docker-entrypoint.sh  # 容器入口
