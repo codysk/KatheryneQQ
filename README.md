@@ -69,6 +69,8 @@ KATHERYNE_CONFIG=./config.json /path/to/QQRoot/qq --no-sandbox --headless
 
 标准动作（32 个）：`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_kick`、`set_group_leave`、`set_group_card`、`set_group_name`、`set_group_admin`、`set_group_avatar`、`set_friend_add_request`、`set_group_add_request`、`can_send_image`、`can_send_record`、`get_status`、`get_version_info`、`get_cookies`、`get_csrf_token`。
 
+go-cqhttp 扩展：`group_poke`、`friend_poke`（主动戳一戳，经 MSF 二进制通道发送 OIDB 0xED3_1；需原生插件 `katheryne_memsync.node` 放行内核 cmd 白名单，原理见 `docs/poke.md`）。
+
 消息段：`text`、`at`、`face`、`image`、`record`、`reply`、`json`。
 
 事件：`message`（私聊/群聊/自发自）、`notice`（群增减员/禁言/踢出/离线）、`request`（好友/加群请求）、`meta_event`（lifecycle/heartbeat）。
