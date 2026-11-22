@@ -47,6 +47,9 @@ export interface KatheryneConfig extends NetworkConfig {
      * of .text trampolines and third-party modules. Also enabled by
      * KATHERYNE_PACKET_DEBUG=1. */
     packet_debug?: boolean;
+    /** Private-chat senders whose messages are dropped before event emission.
+     * Defaults to ['2909288299'] (腾讯新闻); set [] to disable. */
+    blocked_private_uins?: string[];
 }
 
 function resolveConfigPath(): string {
@@ -64,6 +67,7 @@ function loadConfig(): KatheryneConfig {
         ws: { enabled: true, host: '0.0.0.0', port: 6700 },
         reverseWs: { enabled: false, urls: [] },
         console: { enabled: true, host: '0.0.0.0', port: 6099 },
+        blocked_private_uins: ['2909288299'],
     };
 }
 
@@ -93,6 +97,9 @@ class KatheryneRuntime {
     private msgPeerCache = new Map<string, { chatType: number; peerUid: string; senderUid?: string; senderUin?: string; msgSeq?: string }>();
     /** groupCode -> { at, uin -> display name } for @-segment rendering. */
     private memberNickCache = new Map<string, { at: number; byUin: Map<string, string> }>();
+    /** Lazily-built private-sender blocklist from config. */
+    private blockedPrivateSet: Set<string> | null = null;
+    private filteredPrivateLogged = new Set<string>();
     private groupListCache = new Map<string, Record<string, unknown>>();
 
     async start(): Promise<void> {
@@ -1055,6 +1062,34 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
      * server/local ids, so quoting them would otherwise point at an id that
      * never appeared in our event stream. msgSeq is stable across both.
      */
+    /**
+     * Private-chat senders listed in `blocked_private_uins` are dropped before
+     * any event is emitted (default: 2909288299, 腾讯新闻).
+     */
+    private isBlockedPrivateSender(m: RawMessage): boolean {
+        if (this.blockedPrivateSet === null) {
+            const list = this.config.blocked_private_uins ?? ['2909288299'];
+            this.blockedPrivateSet = new Set(list.map((x) => String(x)));
+        }
+        if (this.blockedPrivateSet.size === 0) return false;
+        const senderUid = String(m.senderUid ?? '');
+        const candidates = [
+            String(m.senderUin ?? ''),
+            String(m.peerUin ?? ''),
+            senderUid ? this.uidToUin.get(senderUid) ?? '' : '',
+        ];
+        for (const uin of candidates) {
+            if (uin && this.blockedPrivateSet.has(uin)) {
+                if (!this.filteredPrivateLogged.has(uin)) {
+                    this.filteredPrivateLogged.add(uin);
+                    console.error(`[katheryne] filtered private message from ${uin} (blocked_private_uins)`);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
     private async resolveReplyLocalId(peer: { chatType: number; peerUid: string; guildId?: string }, seq: string): Promise<string | null> {
         try {
             const svc = this.requireServices().msg;
@@ -1087,6 +1122,8 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             const isGroup = chatType === 2;
             const peerUid = String(m.peerUid ?? '');
             const peerUin = this.uidToUin.get(peerUid) ?? (String(m.peerUin ?? '') || peerUid);
+            // Drop blocked private senders (official/news accounts) entirely.
+            if (!isGroup && this.isBlockedPrivateSender(m)) return;
             // Cache message_id -> peer so message_id-only actions (get_msg,
             // delete_msg, mark_msg_as_read) work for received messages too.
             const mid = String(m.msgId ?? '');
