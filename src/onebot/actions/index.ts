@@ -7,7 +7,23 @@
  *           1403 unauthenticated, 1404 action not supported,
  *           1500 handler crashed.
  */
-import { segmentsToNtElements, type OB11Segment } from '../message/segments.js';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { parseCQCode, segmentsToNtElements, type OB11Segment } from '../message/segments.js';
+
+/** Build-time version stamp (scripts/gen-version.mjs writes dist/version.json). */
+let cachedVersion: string | null = null;
+function appVersion(): string {
+    if (cachedVersion !== null) return cachedVersion;
+    try {
+        const file = fileURLToPath(new URL('../../version.json', import.meta.url));
+        const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as { version?: string };
+        cachedVersion = String(raw.version ?? '0.0.0');
+    } catch {
+        cachedVersion = '0.0.0';
+    }
+    return cachedVersion;
+}
 
 export interface PeerRef {
     chatType: number;
@@ -34,7 +50,7 @@ export interface ActionContext {
     getMsgHistory(peer: PeerRef, msgId: string, count: number): Promise<Array<Record<string, unknown>>>;
     markRead(peer: PeerRef): Promise<void>;
     // profile
-    getLoginInfo(): Promise<{ user_id: string; nickname: string }>;
+    getLoginInfo(): Promise<{ user_id: number; nickname: string }>;
     getFriendList(): Promise<Array<Record<string, unknown>>>;
     getStrangerInfo(userUid: string): Promise<Record<string, unknown>>;
     sendLike(userUid: string, times: number): Promise<void>;
@@ -103,19 +119,22 @@ function bool(params: ActionParams, key: string, def = false): boolean {
     return s === 'true' || s === '1' || s === 'yes';
 }
 
-/** group_id / user_id -> NT peer. */async function peerOf(params: ActionParams, ctx: ActionContext, opts: { requireGroup?: boolean } = {}): Promise<PeerRef> {
+/** group_id / user_id -> NT peer. */async function peerOf(params: ActionParams, ctx: ActionContext, opts: { requireGroup?: boolean; requirePrivate?: boolean } = {}): Promise<PeerRef> {
     const groupId = params.group_id as string | undefined;
     const userId = params.user_id as string | undefined;
     const messageType = params.message_type as string | undefined;
 
     if (messageType === 'group' || (groupId && messageType === undefined)) {
+        if (opts.requirePrivate) throw new ActionError(1400, 'send_private_msg requires user_id');
+        if (!groupId) throw new ActionError(1400, 'group_id required');
         // NT group peers are addressed by the group code (uin) directly;
         // no uid resolution needed for groups.
-        return { chatType: 2, peerUid: String(groupId ?? '') };
+        return { chatType: 2, peerUid: String(groupId) };
     }
     if (messageType === 'private' || messageType === undefined) {
         if (opts.requireGroup) throw new ActionError(1400, 'group_id required');
-        const uid = await ensureUidOf(ctx, String(userId ?? ''));
+        if (!userId) throw new ActionError(1400, 'user_id required');
+        const uid = await ensureUidOf(ctx, String(userId));
         if (!uid) throw new ActionError(1400, `cannot resolve user ${userId} to uid`);
         return { chatType: 1, peerUid: uid };
     }
@@ -147,7 +166,12 @@ async function peerForMsg(params: ActionParams, ctx: ActionContext, messageId: s
 
 function segmentsOf(params: ActionParams): OB11Segment[] {
     const message = params.message;
-    if (typeof message === 'string') return [{ type: 'text', data: { text: message } }];
+    if (typeof message === 'string') {
+        // OB11: string messages are CQ code unless auto_escape is true.
+        return bool(params, 'auto_escape', false)
+            ? [{ type: 'text', data: { text: message } }]
+            : parseCQCode(message);
+    }
     if (Array.isArray(message)) return message as OB11Segment[];
     throw new ActionError(1400, 'message must be string or segment array');
 }
@@ -155,7 +179,7 @@ function segmentsOf(params: ActionParams): OB11Segment[] {
 const actions: Record<string, ActionHandler> = {
     // ---------- messaging ----------
     send_private_msg: async (p, ctx) => {
-        const peer = await peerOf(p, ctx);
+        const peer = await peerOf(p, ctx, { requirePrivate: true });
         const r = await ctx.sendMessage(peer, await segmentsToNtElements(segmentsOf(p), { ...ctx, peer }));
         return { message_id: r.msgId };
     },
@@ -179,7 +203,12 @@ const actions: Record<string, ActionHandler> = {
         return await ctx.getMsg(await peerForMsg(p, ctx, mid), mid);
     },
     get_msg_history: async (p, ctx) => {
-        const list = await ctx.getMsgHistory(await peerOf(p, ctx), String(p.message_id ?? ''), num(p, 'count', 20));
+        const mid = String(p.message_id ?? '');
+        // Allow message_id-only history lookups when the peer is cached.
+        const peer = (p.group_id || p.user_id || p.message_type)
+            ? await peerOf(p, ctx)
+            : await peerForMsg(p, ctx, mid);
+        const list = await ctx.getMsgHistory(peer, mid, num(p, 'count', 20));
         return { messages: list };
     },
     mark_msg_as_read: async (p, ctx) => {
@@ -270,13 +299,13 @@ const actions: Record<string, ActionHandler> = {
     can_send_record: async () => ({ yes: true }),
     get_version_info: async () => ({
         app_name: 'KatheryneQQ',
-        app_version: 'v0.2.0',
+        app_version: `v${appVersion()}`,
         protocol_version: 'v11',
     }),
     get_status: async (_p, ctx) => ({
         online: Boolean(ctx.selfUin),
         good: Boolean(ctx.selfUin),
-        login_uin: ctx.selfUin,
+        login_uin: Number(ctx.selfUin),
     }),
 
     // ---------- go-cqhttp extensions ----------
@@ -296,21 +325,46 @@ const actions: Record<string, ActionHandler> = {
     },
     // ---------- public API parity ----------
     get_forward_msg: async (p, ctx) => {
-        const mid = String(p.message_id ?? p.id ?? '');
-        if (!mid) throw new ActionError(1400, 'message_id is required');
-        return { messages: await ctx.getForwardMsg(mid) };
+        const mid = String(p.id ?? p.message_id ?? '');
+        if (!mid) throw new ActionError(1400, 'id is required');
+        const messages = await ctx.getForwardMsg(mid);
+        // public.md names the response field "message" (array of node
+        // segments); go-cqhttp/NapCat clients read "messages" (sender/time/
+        // content objects). Return both.
+        const nodes = messages.map((m) => {
+            const sender = (m.sender ?? {}) as Record<string, unknown>;
+            return {
+                type: 'node',
+                data: {
+                    user_id: sender.user_id ?? '',
+                    nickname: String(sender.nickname ?? ''),
+                    time: m.time,
+                    content: m.message ?? m.content ?? [],
+                },
+            };
+        });
+        return { message: nodes, messages };
     },
     get_group_honor_info: async (p, ctx) => {
         const gid = str(p, 'group_id');
         const info = await ctx.getGroupHonorInfo(gid);
         return { group_id: Number(gid), ...info };
     },
-    get_credentials: async (p, ctx) => await ctx.getCredentials(String(p.domain ?? '')),
+    get_credentials: async (p, ctx) => {
+        const r = await ctx.getCredentials(String(p.domain ?? ''));
+        // OB11 public.md: { cookies, csrf_token } (not "token").
+        return { cookies: r.cookies, csrf_token: r.token };
+    },
     get_record: async (p, ctx) => {
         const file = String(p.file ?? p.file_id ?? '');
+        if (!file) throw new ActionError(1400, 'file is required');
         return await ctx.getMedia(file, p.out_format ? String(p.out_format) : undefined);
     },
-    get_image: async (p, ctx) => await ctx.getMedia(String(p.file ?? p.file_id ?? '')),
+    get_image: async (p, ctx) => {
+        const file = String(p.file ?? p.file_id ?? '');
+        if (!file) throw new ActionError(1400, 'file is required');
+        return await ctx.getMedia(file);
+    },
     set_restart: async (p, ctx) => {
         await ctx.restart(Number(p.delay ?? 0));
         return {};
@@ -322,7 +376,7 @@ const actions: Record<string, ActionHandler> = {
     set_group_anonymous: async () => { throw new ActionError(1404, 'not supported on QQNT (no kernel API)'); },
     set_group_special_title: async () => { throw new ActionError(1404, 'not supported on QQNT (no kernel API)'); },
 
-    get_cookies: async (p, ctx) => ({ cookies: await ctx.getCookies(str(p, 'domain')) }),
+    get_cookies: async (p, ctx) => ({ cookies: await ctx.getCookies(String(p.domain ?? '')) }),
     get_csrf_token: async () => ({ token: 0 }),
 };
 

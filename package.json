@@ -1,13 +1,13 @@
 {
   "name": "katheryneqq",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "OneBot v11 framework for QQNT Linux, driven by the NT kernel API",
   "license": "MIT",
   "type": "module",
   "main": "dist/boot.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json && cp src/console/console.html dist/console/console.html && bash scripts/build-native.sh",
+    "build": "node scripts/gen-version.mjs && tsc -p tsconfig.json && cp src/console/console.html dist/console/console.html && bash scripts/build-native.sh",
     "install-katheryne": "node dist/installer/install.js",
     "build:native": "bash scripts/build-native.sh"
   },

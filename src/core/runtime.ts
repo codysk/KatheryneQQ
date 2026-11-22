@@ -33,7 +33,7 @@ import { LoginFlow } from '../nt/login.js';
 import { collectServices, groupPeer, c2cPeer, type SessionServices } from '../nt/session.js';
 import type { RawMessage } from '../nt/session.js';
 import { EventBus, segmentsToRawText, groupNotifyToNotice, type OB11AnyEvent } from '../onebot/events/bus.js';
-import { ntElementsToSegments, type OB11Segment } from '../onebot/message/segments.js';
+import { ntElementsToSegments, segmentsToCQCode, type OB11Segment } from '../onebot/message/segments.js';
 import { NetworkManager, type NetworkConfig } from '../onebot/network/index.js';
 import { dispatchAction, type ActionContext } from '../onebot/actions/index.js';
 import { WebConsole, type ConsoleConfig, type ConsoleBridge, type ConsoleRuntimeState } from '../console/index.js';
@@ -50,6 +50,8 @@ export interface KatheryneConfig extends NetworkConfig {
     /** Report messages sent by the bot itself as message events with
      * sub_type 'self' (NapCat's reportSelfMessage). Default: false. */
     report_self_message?: boolean;
+    /** meta_event heartbeat interval in ms (default 30000). */
+    heartbeat_interval_ms?: number;
 }
 
 function resolveConfigPath(): string {
@@ -71,6 +73,16 @@ function loadConfig(): KatheryneConfig {
 }
 
 type Phase = ConsoleRuntimeState['phase'];
+
+/** Detect common image formats from magic bytes (for extension-less base64). */
+function sniffImageExt(buf: Buffer): string | undefined {
+    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+    if (buf.length >= 6 && buf.subarray(0, 3).toString('ascii') === 'GIF') return 'gif';
+    if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'webp';
+    if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp';
+    return undefined;
+}
 
 class KatheryneRuntime {
     private kernel: LoadedKernel | null = null;
@@ -94,9 +106,15 @@ class KatheryneRuntime {
     private uidToUin = new Map<string, string>();
     /** msgId -> peer, harvested from every message; enables message_id-only actions. */
     private msgPeerCache = new Map<string, { chatType: number; peerUid: string; senderUid?: string; senderUin?: string; msgSeq?: string }>();
-    /** groupCode -> { at, uin -> display name } for @-segment rendering. */
-    private memberNickCache = new Map<string, { at: number; byUin: Map<string, string> }>();
+    /** groupCode -> { at, uin -> {nick, card, role} } for @ and sender meta. */
+    private memberInfoCache = new Map<string, { at: number; byUin: Map<string, { nick: string; card: string; role: string }> }>();
+    private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     private groupListCache = new Map<string, Record<string, unknown>>();
+    /** friend-request flag (reqTime) -> {uid, reqTime}, for set_friend_add_request. */
+    private friendReqCache = new Map<string, { uid: string; reqTime: string }>();
+    /** Recently seen message ids, oldest -> newest (for rounded-id recovery). */
+    private recentMsgIds: string[] = [];
+    private recentMsgIdSet = new Set<string>();
     /** fileKey -> media element location (get_image / get_record downloads). */
     private mediaIndex = new Map<string, {
         peer: { chatType: number; peerUid: string; guildId?: string };
@@ -341,6 +359,7 @@ class KatheryneRuntime {
                 meta_event_type: 'lifecycle',
                 sub_type: 'connect',
             });
+            this.startHeartbeat();
             this.consoleMgr?.log(`online as ${this.selfNick} (${this.selfUin})`);
         } catch (e) {
             this.phase = 'error';
@@ -374,7 +393,7 @@ class KatheryneRuntime {
                         const recallTime = Number((m as Record<string, unknown>).recallTime ?? 0);
                         const secs = recallTime > 10_000_000_000 ? recallTime / 1000 : recallTime;
                         if (Number.isFinite(secs) && secs > this.bootTimeSec - 60) {
-                            this.emitRecallEvent(m, revokeEl.grayTipElement.revokeElement);
+                            void this.emitRecallEvent(m, revokeEl.grayTipElement.revokeElement);
                         }
                         continue;
                     }
@@ -428,26 +447,65 @@ class KatheryneRuntime {
                 for (const g of groupList ?? []) {
                     const code = String(g.groupCode ?? '');
                     if (code) this.groupListCache.set(code, {
-                        group_id: code,
+                        group_id: Number(code) || code,
                         group_name: String(g.groupName ?? ''),
                         member_count: Number(g.memberCount ?? 0),
                         max_member_count: Number(g.maxMember ?? 0),
+                        group_all_shut: Number(g.groupShutupExpireTime ?? 0) > 0 ? -1 : 0,
+                        group_remark: String(g.remarkName ?? ''),
                     });
                 }
             },
             onGroupNotifiesUpdated: (_doubt: boolean, notifies: Array<Record<string, unknown>>) => {
-                for (const n of notifies ?? []) {
-                    const ev = groupNotifyToNotice(n, this.selfUin, (uid) => this.uidToUin.get(uid) ?? null);
-                    if (ev) this.bus.emit(ev);
-                }
+                void this.emitGroupNotifies(notifies);
             },
             onGroupSingleScreenNotifies: (_doubt: boolean, _seq: string, notifies: Array<Record<string, unknown>>) => {
-                for (const n of notifies ?? []) {
-                    const ev = groupNotifyToNotice(n, this.selfUin, (uid) => this.uidToUin.get(uid) ?? null);
-                    if (ev) this.bus.emit(ev);
-                }
+                void this.emitGroupNotifies(notifies);
             },
         }));
+    }
+
+    /** Resolve uids first so notice user_id/operator_id are numeric uins. */
+    private async emitGroupNotifies(notifies: Array<Record<string, unknown>>): Promise<void> {
+        const recent = (notifies ?? []).filter((n) => {
+            // notify.seq is microsecond-based; skip pre-boot backlog (NapCat parity).
+            const notifyTime = Number(n.seq ?? 0) / 1_000_000;
+            return !(notifyTime > 0 && notifyTime < this.bootTimeSec);
+        });
+        const uids = new Set<string>();
+        for (const n of recent) {
+            for (const key of ['user1', 'user2', 'actionUser']) {
+                const uid = String((n[key] as Record<string, unknown> | undefined)?.uid ?? '');
+                if (uid && uid !== '0') uids.add(uid);
+            }
+        }
+        await Promise.all([...uids].map((uid) => this.uinOfUid(uid)));
+        for (const n of recent) {
+            const ev = groupNotifyToNotice(n, this.selfUin, (uid) => this.uidToUin.get(uid) ?? null);
+            if (ev) this.bus.emit(ev);
+        }
+    }
+
+    private async emitBuddyRequests(arg: Record<string, unknown>): Promise<void> {
+        const reqs = (arg?.reqList ?? arg?.newList ?? []) as Array<Record<string, unknown>>;
+        for (const r of reqs) {
+            const uid = String(r.friendUid ?? r.uid ?? '');
+            const reqTime = String(r.reqTime ?? '');
+            const flag = reqTime || uid;
+            this.friendReqCache.set(flag, { uid, reqTime });
+            const uin = uid ? await this.uinOfUid(uid) : '';
+            const userId = uin || this.uidToUin.get(uid) || uid;
+            this.bus.emit({
+                time: Math.floor(Date.now() / 1000),
+                self_id: this.selfUin,
+                post_type: 'request',
+                request_type: 'friend',
+                sub_type: String(r.sourceType ?? 'normal'),
+                user_id: Number(userId) || userId,
+                comment: String(r.reqTopic ?? ''),
+                flag,
+            });
+        }
     }
 
     private attachBuddyListener(): void {
@@ -455,20 +513,7 @@ class KatheryneRuntime {
         if (!buddyService) return;
         buddyService.addKernelBuddyListener(listenerProxy({
             onBuddyReqChange: (arg: Record<string, unknown>) => {
-                const reqs = (arg?.reqList ?? arg?.newList ?? []) as Array<Record<string, unknown>>;
-                for (const r of reqs) {
-                    const uid = String(r.friendUid ?? r.uid ?? '');
-                    this.bus.emit({
-                        time: Math.floor(Date.now() / 1000),
-                        self_id: this.selfUin,
-                        post_type: 'request',
-                        request_type: 'friend',
-                        sub_type: String(r.sourceType ?? 'normal'),
-                        user_id: this.uidToUin.get(uid) ?? uid,
-                        comment: String(r.reqTopic ?? ''),
-                        flag: String(r.reqTime ?? uid),
-                    });
-                }
+                void this.emitBuddyRequests(arg);
             },
         }));
     }
@@ -505,17 +550,24 @@ class KatheryneRuntime {
                 const profile = this.services?.profile;
                 if (profile) {
                     try {
-                        const res = await profile.getCoreAndBaseInfo('nodeStore', uids);
-                        console.log('[katheryne] getCoreAndBaseInfo raw keys:', JSON.stringify(Object.keys(res ?? {})), 'sample:', JSON.stringify(res).slice(0, 400));
-                        const infos = res?.result?.info ?? res?.info ?? [];
-                        for (const f of infos) {
-                            const uid = String(f.uid ?? '');
-                            const uin = String(f.uin ?? '');
+                        const res = (await profile.getCoreAndBaseInfo('nodeStore', uids)) as any;
+                        // Map<uid, {coreInfo:{uin},...}> (usually), or a plain object.
+                        const raw: any = res instanceof Map ? res : (res?.result?.info ?? res?.info ?? res);
+                        const entries: Array<[string, any]> = raw instanceof Map
+                            ? [...raw.entries()]
+                            : Array.isArray(raw)
+                                ? raw.map((f: any) => [String(f.uid ?? ''), f] as [string, any])
+                                : Object.entries(raw ?? {});
+                        let mapped = 0;
+                        for (const [uid, info] of entries) {
+                            const uin = String(info?.coreInfo?.uin ?? info?.uin ?? '');
                             if (uid && uin && uin !== '0') {
                                 this.uinToUid.set(uin, uid);
                                 this.uidToUin.set(uid, uin);
+                                mapped++;
                             }
                         }
+                        console.log(`[katheryne] getCoreAndBaseInfo: ${entries.length} entries, ${mapped} uin mappings`);
                     } catch { /* kernel refused bulk fetch */ }
                 }
             }
@@ -549,7 +601,7 @@ class KatheryneRuntime {
             const isGroup = Number(chatType) === 2;
             const selfUin = this.uidToUin.get(String(recalled.senderUid ?? '')) ?? String(recalled.senderUin ?? '');
             const operator = this.uidToUin.get(operatorUid) ?? this.resolveUidLive(operatorUid) ?? operatorUid;
-            this.emitRecallEvent(recalled as RawMessage, revoke);
+            await this.emitRecallEvent(recalled as RawMessage, revoke);
             this.consoleMgr?.log(`recall event: seq=${msgSeq}`);
         } catch (e) {
             console.error('[katheryne] recall handler error', e);
@@ -576,95 +628,163 @@ class KatheryneRuntime {
     private reportedRecalls = new Set<string>();
 
     /** Emit recall notice from a gray-tip update (NapCat handleRecallMessage pattern). */
-    private emitRecallEvent(m: RawMessage, revoke: Record<string, any>): void {
+    private async emitRecallEvent(m: RawMessage, revoke: Record<string, any>): Promise<void> {
         const key = String(m.msgId ?? '');
         if (this.reportedRecalls.has(key)) return;
         this.reportedRecalls.add(key);
         if (this.reportedRecalls.size > 500) this.reportedRecalls.clear();
         const isGroup = Number(m.chatType ?? 0) === 2;
         const operatorUid = String(revoke.operatorUid ?? '');
-        const operator = this.uidToUin.get(operatorUid) ?? this.resolveUidLive(operatorUid) ?? operatorUid;
-        const author = this.uidToUin.get(String(m.senderUid ?? '')) ?? String(m.senderUin ?? '');
+        const operator = (await this.uinOfUid(operatorUid)) || this.resolveUidLive(operatorUid) || operatorUid;
+        const author = (await this.uinOfUid(String(m.senderUid ?? ''))) || String(m.senderUin ?? '');
+        const groupUin = this.uidToUin.get(String(m.peerUid ?? '')) ?? (String(m.peerUin ?? '') || String(m.peerUid ?? ''));
+        const asId = (v: string): number | string => (Number(v) > 0 ? Number(v) : v);
         this.bus.emit({
             time: Math.floor(Date.now() / 1000),
             self_id: this.selfUin,
             post_type: 'notice',
             notice_type: isGroup ? 'group_recall' : 'friend_recall',
-            group_id: isGroup ? (this.uidToUin.get(String(m.peerUid ?? '')) ?? String(m.peerUid ?? '')) : undefined,
-            user_id: author || operator,
-            operator_id: isGroup ? operator : undefined,
+            group_id: isGroup ? asId(groupUin) : undefined,
+            user_id: asId(author || operator),
+            operator_id: isGroup ? asId(operator) : undefined,
             message_id: String(m.msgId ?? ''),
         } as never);
         this.consoleMgr?.log(`recall: ${isGroup ? 'group' : 'friend'} msg=${key}`);
     }
 
+    /** uid -> uin (self-aware, kernel uix fallback). */
+    private async uinOfUid(uid: string): Promise<string> {
+        if (!uid) return '';
+        if (uid === this.selfUid) return this.selfUin;
+        const cached = this.uidToUin.get(uid);
+        if (cached) return cached;
+        try {
+            const uix = this.services?.uix;
+            const uin = uix?.getUin?.([uid])?.uinInfo?.get?.(uid);
+            if (uin && String(uin) !== '0') {
+                this.uidToUin.set(uid, String(uin));
+                this.uinToUid.set(String(uin), uid);
+                return String(uin);
+            }
+        } catch { /* ignore */ }
+        // uix only knows contacts already in its cache; the profile service
+        // can resolve any uid (same Map<uid,{coreInfo}> path as the friend
+        // list and get_stranger_info).
+        try {
+            const profile = this.services?.profile;
+            const res = (await profile?.getCoreAndBaseInfo?.('nodeStore', [uid])) as any;
+            const raw: any = res instanceof Map ? res : (res?.result?.info ?? res?.info ?? res);
+            const info = raw instanceof Map ? raw.get(uid) : raw?.[uid];
+            const uin = String(info?.coreInfo?.uin ?? info?.uin ?? '');
+            if (uin && uin !== '0') {
+                this.uidToUin.set(uid, uin);
+                this.uinToUid.set(uin, uid);
+                return uin;
+            }
+        } catch { /* ignore */ }
+        return '';
+    }
+
     private async emitGrayTip(m: RawMessage): Promise<void> {
         try {
             const els = (m.elements ?? []) as Array<Record<string, any>>;
+            const isGroup = Number(m.chatType ?? 0) === 2;
+            const peerUid = String(m.peerUid ?? '');
+            const groupUin = this.uidToUin.get(peerUid) ?? (String(m.peerUin ?? '') || peerUid);
+            const asId = (v: string): number | string => (Number(v) > 0 ? Number(v) : v);
             for (const el of els) {
                 const gray = el.grayTipElement;
-                // Debug: dump gray-tip payload shapes to learn the real poke representation.
-                if (this.pokeShapeDebug && gray) {
-                    const json = gray.jsonGrayTipElement?.jsonStr;
-                    const summary = typeof json === 'string' ? json.slice(0, 300) : undefined;
-                    console.error('[graytip-shape]', JSON.stringify({
-                        chatType: m.chatType,
-                        subType: gray.subElementType,
-                        hasFace: !!el.faceElement,
-                        faceElement: el.faceElement ?? undefined,
-                        json: summary,
-                    }).slice(0, 700));
-                }
                 if (!gray) continue;
-                const isGroup = Number(m.chatType ?? 0) === 2;
                 const base = {
-                    time: Math.floor(Date.now() / 1000),
-                    self_id: this.selfUin,
+                    time: Number(m.msgTime ?? 0) || Math.floor(Date.now() / 1000),
+                    self_id: Number(this.selfUin) || this.selfUin,
                     post_type: 'notice' as const,
-                    group_id: isGroup ? (this.uidToUin.get(String(m.peerUid ?? '')) ?? String(m.peerUid ?? '')) : undefined,
+                    group_id: isGroup ? (Number(groupUin) || groupUin) : undefined,
                 };
                 if (gray.revokeElement) {
-                    this.emitRecallEvent(m, gray.revokeElement);
-                } else if (gray.jsonGrayTipElement?.jsonStr) {
-                    // Poke (拍一拍): json.items = [{uid}, {uid}]
-                    try {
-                        const json = JSON.parse(gray.jsonGrayTipElement.jsonStr);
-                        const uids = (json.items ?? []).filter((it: { uid?: string }) => it.uid).map((it: { uid: string }) => it.uid);
-                        if (uids.length === 2) {
-                            const [fromUid, toUid] = uids;
-                            // Resolve NT uids -> QQ uins via profile batch lookup.
-                            let fromUin = this.uidToUin.get(fromUid) ?? '';
-                            let toUin = this.uidToUin.get(toUid) ?? '';
-                            try {
-                                const profile = this.services?.profile;
-                                if (profile && (!fromUin || !toUin)) {
-                                    const res = await profile.getUserSimpleInfo?.(false, uids);
-                                    const infoMap = (res?.result?.info ?? res?.info ?? {}) as unknown;
-                                    const getUin = (uid: string): string => {
-                                        if (!infoMap) return '';
-                                        const mm = infoMap as Map<string, Record<string, any>>;
-                                        const info = typeof mm.get === 'function' ? mm.get(uid) : (infoMap as Record<string, Record<string, any>>)[uid];
-                                        return String(info?.coreInfo?.uin ?? info?.uin ?? '').replace(/^0+$/, '');
-                                    };
-                                    fromUin = fromUin || getUin(fromUid);
-                                    toUin = toUin || getUin(toUid);
-                                }
-                            } catch { /* fall back to uid */ }
+                    await this.emitRecallEvent(m, gray.revokeElement);
+                    continue;
+                }
+                // Group system tips: name change / member shut-up / self join.
+                const ge = gray.groupElement as Record<string, any> | undefined;
+                if (ge) {
+                    const tipType = Number(ge.type ?? 0);
+                    if (tipType === 5) { // KGROUPNAMEMODIFIED
+                        const operator = await this.uinOfUid(String(ge.memberUid ?? ''));
+                        this.bus.emit({
+                            ...base,
+                            notice_type: 'notify',
+                            sub_type: 'group_name',
+                            user_id: asId(operator || '0'),
+                            name_new: String(ge.groupName ?? ''),
+                        } as never);
+                        continue;
+                    }
+                    if (tipType === 8 && ge.shutUp) { // KSHUTUP
+                        const su = ge.shutUp as Record<string, any>;
+                        let duration = Number(su.duration ?? 0);
+                        const memberUid = String(su.member?.uid ?? '');
+                        const adminUid = String(su.admin?.uid ?? '');
+                        const memberUin = memberUid ? (await this.uinOfUid(memberUid) || memberUid) : '0';
+                        const adminUin = adminUid ? (await this.uinOfUid(adminUid) || adminUid) : '0';
+                        if (memberUin && adminUin) {
+                            if (!memberUid && duration > 0) duration = -1; // whole-group ban
                             this.bus.emit({
                                 ...base,
-                                notice_type: 'poke',
-                                user_id: fromUin || fromUid,
-                                target_id: toUin || toUid,
+                                notice_type: 'group_ban',
+                                sub_type: duration > 0 ? 'ban' : 'lift_ban',
+                                user_id: asId(memberUin),
+                                operator_id: asId(adminUin),
+                                duration,
                             } as never);
                         }
-                    } catch { /* not a poke json */ }
+                        continue;
+                    }
+                    if (tipType === 1) { // KMEMBERADD — self joined
+                        if (String(ge.memberUid ?? '') === this.selfUid) {
+                            const op = await this.uinOfUid(String(ge.adminUid ?? ''));
+                            this.bus.emit({
+                                ...base,
+                                notice_type: 'group_increase',
+                                sub_type: 'approve',
+                                user_id: asId(this.selfUin),
+                                operator_id: asId(op || '0'),
+                            } as never);
+                        }
+                        continue;
+                    }
                 }
+                const jsonStr = gray.jsonGrayTipElement?.jsonStr;
+                if (!jsonStr) continue;
+                let json: Record<string, any>;
+                try { json = JSON.parse(jsonStr) as Record<string, any>; } catch { continue; }
+                // Poke tips: NapCat keys on busiId 1061; fall back to wording.
+                const busiId = String(gray.jsonGrayTipElement?.busiId ?? '');
+                const isPoke = busiId === '1061' || jsonStr.includes('戳了戳') || jsonStr.includes('拍了拍');
+                if (!isPoke) continue;
+                const uids = (json.items ?? [])
+                    .filter((it: { uid?: string }) => it.uid)
+                    .map((it: { uid: string }) => it.uid) as string[];
+                if (uids.length < 2) continue;
+                const fromUid = uids[0];
+                const toUid = uids[uids.length - 1];
+                const fromUin = await this.uinOfUid(fromUid);
+                const toUin = await this.uinOfUid(toUid);
+                // go-cqhttp / NapCat format: notice_type=notify, sub_type=poke.
+                this.bus.emit({
+                    ...base,
+                    notice_type: 'notify',
+                    sub_type: 'poke',
+                    user_id: asId(fromUin || fromUid),
+                    target_id: asId(toUin || toUid),
+                    ...(isGroup ? {} : { sender_id: asId(fromUin || fromUid) }),
+                    raw_info: json,
+                } as never);
             }
         } catch (e) {
             console.error('[katheryne] gray tip error', e);
         }
     }
-
 
     // ---------------- OIDB packet send (poke etc.) ----------------
 
@@ -1177,6 +1297,231 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
         }
     }
 
+    /** groupCode -> uin -> {nick, card, role}; cached for 5 minutes. */
+    private async ensureMemberInfo(groupCode: string, force = false): Promise<Map<string, { nick: string; card: string; role: string }> | null> {
+        const now = Date.now();
+        const key = String(groupCode);
+        const cached = this.memberInfoCache.get(key);
+        if (!force && cached && now - cached.at < 300_000) return cached.byUin;
+        try {
+            const group = this.requireServices().group;
+            const res = await group.getAllMemberList(key, true);
+            const result = (res?.result ?? res ?? {}) as Record<string, unknown>;
+            const ids = (result?.ids ?? []) as Array<{ uid: string }>;
+            const infosRaw = result?.infos as unknown;
+            const asMap = infosRaw as Map<string, Record<string, any>>;
+            const getInfo = (uid: string) => (typeof asMap?.get === 'function'
+                ? asMap.get(uid)
+                : (infosRaw as Record<string, Record<string, any>>)?.[uid]);
+            const byUin = new Map<string, { nick: string; card: string; role: string }>();
+            for (const { uid } of ids) {
+                const info = getInfo(uid) ?? {};
+                const u = String(info.uin ?? '');
+                if (!u) continue;
+                const roleNum = Number(info.role ?? 0);
+                byUin.set(u, {
+                    nick: String(info.nick ?? ''),
+                    card: String(info.cardName ?? ''),
+                    role: roleNum === 4 ? 'owner' : roleNum === 3 ? 'admin' : 'member',
+                });
+            }
+            this.memberInfoCache.set(key, { at: now, byUin });
+            return byUin;
+        } catch {
+            return cached?.byUin ?? null;
+        }
+    }
+
+    private async memberMeta(groupCode: string, uin: string): Promise<{ nick: string; card: string; role: string } | undefined> {
+        const map = await this.ensureMemberInfo(String(groupCode));
+        return map?.get(String(uin));
+    }
+
+    private startHeartbeat(): void {
+        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        const interval = Math.max(5_000, Number(this.config.heartbeat_interval_ms ?? 30_000));
+        const beat = () => this.bus.emit({
+            time: Math.floor(Date.now() / 1000),
+            self_id: Number(this.selfUin) || this.selfUin,
+            post_type: 'meta_event',
+            meta_event_type: 'heartbeat',
+            status: { online: this.phase === 'online', good: this.phase === 'online' },
+            interval,
+        } as never);
+        beat();
+        this.heartbeatTimer = setInterval(beat, interval);
+    }
+
+    /** group_upload notice for file messages (KMSGTYPEFILE = 3). */
+    private emitGroupUpload(m: RawMessage): void {
+        const fileEl = ((m.elements ?? []) as Array<Record<string, any>>).find((e) => e?.fileElement);
+        const fe = fileEl?.fileElement as Record<string, any> | undefined;
+        if (!fe) return;
+        const peerUid = String(m.peerUid ?? '');
+        const groupUin = this.uidToUin.get(peerUid) ?? (String(m.peerUin ?? '') || peerUid);
+        const senderUin = String(m.senderUin ?? '') || this.uidToUin.get(String(m.senderUid ?? '')) || '';
+        const asId = (v: string): number | string => (Number(v) > 0 ? Number(v) : v);
+        this.bus.emit({
+            time: Number(m.msgTime ?? 0) || Math.floor(Date.now() / 1000),
+            self_id: Number(this.selfUin) || this.selfUin,
+            post_type: 'notice',
+            notice_type: 'group_upload',
+            group_id: asId(groupUin),
+            user_id: asId(senderUin),
+            file: {
+                id: String(fe.fileUuid ?? fe.fileId ?? fe.fileName ?? ''),
+                name: String(fe.fileName ?? ''),
+                size: Number(fe.fileSize ?? 0),
+                busid: Number(fe.fileBizId ?? 0),
+            },
+        } as never);
+    }
+
+    /** Emit group_card when a member's group card differs from our cache. */
+    private async maybeEmitGroupCard(m: RawMessage): Promise<void> {
+        const senderUin = String(m.senderUin ?? '') || this.uidToUin.get(String(m.senderUid ?? '')) || '';
+        if (!senderUin || senderUin === '0') return;
+        const peerUid = String(m.peerUid ?? '');
+        const groupUin = this.uidToUin.get(peerUid) ?? (String(m.peerUin ?? '') || peerUid);
+        const map = await this.ensureMemberInfo(String(groupUin));
+        const cached = map?.get(senderUin);
+        if (!cached) return;
+        const newCard = String(m.sendMemberName ?? '');
+        if (cached.card === newCard) return;
+        const asId = (v: string): number | string => (Number(v) > 0 ? Number(v) : v);
+        this.bus.emit({
+            time: Number(m.msgTime ?? 0) || Math.floor(Date.now() / 1000),
+            self_id: Number(this.selfUin) || this.selfUin,
+            post_type: 'notice',
+            notice_type: 'group_card',
+            group_id: asId(groupUin),
+            user_id: asId(senderUin),
+            card_new: newCard,
+            card_old: cached.card,
+        } as never);
+        cached.card = newCard;
+    }
+
+    /** Build the OB11 (array-format) message object for a raw kernel message. */
+    private rememberMsgId(id: string): void {
+        if (!id || this.recentMsgIdSet.has(id)) return;
+        this.recentMsgIdSet.add(id);
+        this.recentMsgIds.push(id);
+        if (this.recentMsgIds.length > 1000) {
+            const dropped = this.recentMsgIds.shift();
+            if (dropped) this.recentMsgIdSet.delete(dropped);
+        }
+    }
+
+    /**
+     * 19-digit snowflake ids cannot round-trip through a JSON number. If a
+     * caller passes a rounded id (common with clients that coerce
+     * message_id to Number), map it back to the recent id within the double
+     * ULP window — but only when the match is unambiguous.
+     */
+    private canonicalMsgId(rawId: string): string {
+        const id = String(rawId ?? '');
+        if (!/^\d{17,}$/.test(id)) return id;
+        if (this.recentMsgIdSet.has(id) || this.msgPeerCache.has(id)) return id;
+        let input: bigint;
+        try { input = BigInt(id); } catch { return id; }
+        let match = '';
+        for (let i = this.recentMsgIds.length - 1; i >= 0; i--) {
+            const cand = this.recentMsgIds[i];
+            if (!/^\d+$/.test(cand)) continue;
+            const c = BigInt(cand);
+            const diff = c > input ? c - input : input - c;
+            if (diff > 4096n) continue;
+            if (match && match !== cand) return id; // ambiguous: never guess
+            match = cand;
+        }
+        return match || id;
+    }
+
+    /** Human hint for the classic "id came back as a JSON number" failure. */
+    private msgNotFoundError(id: string): Error {
+        const rounded = /^\d{17,}$/.test(id) && String(Number(id)) === id;
+        return new Error(rounded
+            ? `message not found: ${id} looks like a 19-digit id rounded by JSON number precision; keep message_id as a string`
+            : `message not found: ${id}`);
+    }
+
+    private async buildOB11Message(m: RawMessage, sentOverride?: boolean): Promise<Record<string, unknown>> {
+        const senderUid = String(m.senderUid ?? '');
+        const senderUinRaw = String(m.senderUin ?? '');
+        if (senderUid && senderUinRaw && senderUinRaw !== '0') {
+            this.uidToUin.set(senderUid, senderUinRaw);
+            this.uinToUid.set(senderUinRaw, senderUid);
+        }
+        const chatType = Number(m.chatType ?? 0);
+        const isGroup = chatType === 2;
+        const peerUid = String(m.peerUid ?? '');
+        const peerUin = this.uidToUin.get(peerUid) ?? (String(m.peerUin ?? '') || peerUid);
+        const senderUin = senderUinRaw || this.uidToUin.get(senderUid) || '';
+        const sent = sentOverride ?? (!!senderUin && senderUin === this.selfUin);
+        const mid = String(m.msgId ?? '');
+        if (mid) this.rememberMsgId(mid);
+        if (mid && peerUid) this.msgPeerCache.set(mid, { chatType, peerUid });
+
+        let nick = String(m.senderNick ?? '');
+        let card = '';
+        let role: string | undefined;
+        let groupName = '';
+        if (isGroup) {
+            const meta = await this.memberMeta(String(peerUin), senderUin);
+            if (meta) {
+                nick = meta.nick || nick;
+                card = meta.card;
+                role = meta.role;
+            }
+            const g = this.groupListCache.get(String(peerUin)) as Record<string, unknown> | undefined;
+            groupName = String(g?.group_name ?? g?.groupName ?? '');
+        }
+
+        const segments = await ntElementsToSegments(
+            (m.elements ?? []) as Array<Record<string, unknown>>,
+            {
+                resolveUid: (uid) => this.uidToUin.get(uid) ?? null,
+                selfUid: this.selfUid,
+                peer: { chatType, peerUid, guildId: '' },
+                resolveReplyId: (p2, seq) => this.resolveReplyLocalId(p2, seq),
+                msgId: mid,
+                rememberMedia: (key, meta) => this.rememberMediaElement(key, meta),
+            },
+        );
+
+        const event: Record<string, unknown> = {
+            time: Number(m.msgTime ?? 0) || Math.floor(Date.now() / 1000),
+            self_id: Number(this.selfUin) || this.selfUin,
+            post_type: sent ? 'message_sent' : 'message',
+            message_type: isGroup ? 'group' : 'private',
+            sub_type: isGroup ? 'normal' : 'friend',
+            message_id: mid,
+            message_seq: mid,
+            real_id: mid,
+            real_seq: String(m.msgSeq ?? ''),
+            user_id: Number(senderUin) || senderUin,
+            message: segments,
+            raw_message: segmentsToCQCode(segments),
+            font: 14,
+            message_format: 'array',
+            sender: {
+                user_id: Number(senderUin) || senderUin,
+                nickname: nick || senderUin,
+                card: isGroup ? card : '',
+                role,
+            },
+        };
+        if (isGroup) {
+            event.group_id = Number(peerUin) || peerUin;
+            event.group_name = groupName;
+        }
+        if (sent || !isGroup) {
+            event.target_id = Number(peerUin) || peerUin;
+        }
+        return event;
+    }
+
     private async emitMessage(m: RawMessage, sent: boolean): Promise<void> {
         try {
             // NapCat-style message filters (parity with its onRecvMsg path):
@@ -1187,64 +1532,102 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             if (msgType === 1) return;
             // 3) history/backfill older than process start is not reported
             if (!sent && Number(m.msgTime ?? 0) > 0 && Number(m.msgTime) < this.bootTimeSec) return;
-            // Harvest uid<->uin pairs from every message (covers friends and strangers).
-            const senderUid = String(m.senderUid ?? '');
-            const senderUin = String(m.senderUin ?? '');
-            if (senderUid && senderUin && senderUin !== '0') {
-                this.uidToUin.set(senderUid, senderUin);
-                this.uinToUid.set(senderUin, senderUid);
-            }
-            // KMSGTYPEGRAYTIPS = 5 (NapCat NTMsgType). 9 is REPLY, not gray tip!
+            // KMSGTYPEGRAYTIPS = 5; 9 is REPLY, not a gray tip.
             if (msgType === 5) {
                 void this.emitGrayTip(m);
                 return;
             }
             const chatType = Number(m.chatType ?? 0);
-            const isGroup = chatType === 2;
-            const peerUid = String(m.peerUid ?? '');
-            const peerUin = this.uidToUin.get(peerUid) ?? (String(m.peerUin ?? '') || peerUid);
-            // Cache message_id -> peer so message_id-only actions (get_msg,
-            // delete_msg, mark_msg_as_read) work for received messages too.
-            const mid = String(m.msgId ?? '');
-            if (mid && peerUid) {
-                this.msgPeerCache.set(mid, { chatType, peerUid });
+            if (!sent && chatType === 2) {
+                try {
+                    if (msgType === 3) this.emitGroupUpload(m);
+                    else await this.maybeEmitGroupCard(m);
+                } catch { /* non-fatal */ }
             }
-            const segments = await ntElementsToSegments(
-                (m.elements ?? []) as Array<Record<string, unknown>>,
-                {
-                    resolveUid: (uid) => this.uidToUin.get(uid) ?? null,
-                    selfUid: this.selfUid,
-                    peer: { chatType, peerUid, guildId: '' },
-                    resolveReplyId: (p2, seq) => this.resolveReplyLocalId(p2, seq),
-                    msgId: mid,
-                    rememberMedia: (key, meta) => this.rememberMediaElement(key, meta),
-                },
-            );
-            const event = {
-                time: Math.floor(Date.now() / 1000),
-                self_id: this.selfUin,
-                post_type: 'message' as const,
-                message_type: isGroup ? ('group' as const) : ('private' as const),
-                sub_type: sent ? 'self' : 'normal',
-                message_id: String(m.msgId ?? ''),
-                user_id: String(m.senderUin ?? this.uidToUin.get(String(m.senderUid ?? '')) ?? ''),
-                group_id: isGroup ? peerUin : undefined,
-                message: segments,
-                raw_message: segmentsToRawText(segments),
-                font: 0,
-                sender: {
-                    user_id: String(m.senderUin ?? ''),
-                    nickname: String(m.senderNick ?? ''),
-                    card: isGroup ? String(m.senderNick ?? '') : undefined,
-                    role: undefined,
-                },
-            };
+            const event = await this.buildOB11Message(m, sent);
             this.bus.emit(event as OB11AnyEvent);
         } catch (e) {
             console.error('[katheryne] emitMessage error', e);
         }
     }
 
+    /**
+     * Turn a flexible image source into a local file the kernel can ingest.
+     * Accepts absolute paths, file://, data: URIs (base64 or percent-encoded),
+     * base64://, bare base64 image bodies, and http(s) URLs (downloaded).
+     */
+    private async materializeImageSource(src: string): Promise<string> {
+        const raw = String(src ?? '').trim();
+        if (!raw) throw new Error('empty image source');
+        if (raw.startsWith('/')) {
+            if (!fs.existsSync(raw)) throw new Error(`image file not found: ${raw}`);
+            return raw;
+        }
+        if (/^file:\/\//i.test(raw)) {
+            const { fileURLToPath } = await import('node:url');
+            const p = fileURLToPath(raw);
+            if (!fs.existsSync(p)) throw new Error(`image file not found: ${p}`);
+            return p;
+        }
+        // Received-image file name: reuse the indexed local path or URL.
+        if (!/^(data:|base64:|https?:)/i.test(raw)) {
+            const meta = this.mediaIndex.get(raw);
+            if (meta?.localPath && fs.existsSync(meta.localPath)) return meta.localPath;
+            if (meta?.url) return await this.materializeImageSource(meta.url);
+        }
+        const dir = this.downloadTempPath && fs.existsSync(this.downloadTempPath)
+            ? this.downloadTempPath
+            : os.tmpdir();
+        fs.mkdirSync(dir, { recursive: true });
+        const writeTemp = (buf: Buffer, extHint?: string): string => {
+            if (!buf.length) throw new Error('empty image data');
+            const ext = String(extHint || sniffImageExt(buf) || 'png').replace(/^\./, '').replace(/[^a-z0-9]/gi, '') || 'png';
+            const file = path.join(dir, `katheryne-img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
+            fs.writeFileSync(file, buf);
+            return file;
+        };
+        const dataUri = /^data:([^;,]*)(;base64)?,([\s\S]*)$/i.exec(raw);
+        if (dataUri) {
+            const mime = dataUri[1] ?? '';
+            const buf = dataUri[2]
+                ? Buffer.from(dataUri[3], 'base64')
+                : Buffer.from(decodeURIComponent(dataUri[3]), 'utf8');
+            return writeTemp(buf, mime.split('/')[1]?.split('+')[0]);
+        }
+        if (/^base64:\/\//i.test(raw)) {
+            return writeTemp(Buffer.from(raw.replace(/^base64:\/\//i, '').replace(/\s+/g, ''), 'base64'));
+        }
+        // Bare base64 body (only when it clearly decodes to an image).
+        if (!/[\\/:]/.test(raw) && /^[A-Za-z0-9+/=\s]+$/.test(raw) && raw.replace(/\s+/g, '').length > 100) {
+            const buf = Buffer.from(raw.replace(/\s+/g, ''), 'base64');
+            const ext = sniffImageExt(buf);
+            if (ext) return writeTemp(buf, ext);
+        }
+        if (/^https?:\/\//i.test(raw)) {
+            // Re-sending an image we received: the CDN URL may need QQ's
+            // internal downloader (plain fetch gets 400), so reuse the
+            // indexed element path first.
+            for (const meta of this.mediaIndex.values()) {
+                if (meta.url !== raw) continue;
+                if (meta.localPath && fs.existsSync(meta.localPath)) return meta.localPath;
+                if (meta.elementId) {
+                    try { return await this.downloadRichMedia(meta, 4_000); } catch { /* fall through */ }
+                }
+                break;
+            }
+            const res = await fetch(raw, { redirect: 'follow', signal: AbortSignal.timeout(30_000) });
+            if (!res.ok) {
+                throw new Error(`image download failed: HTTP ${res.status} (QQ CDN URLs may only be downloadable by the client; use a local path/base64 instead)`);
+            }
+            const declared = Number(res.headers.get('content-length') ?? 0);
+            if (declared > 20 * 1024 * 1024) throw new Error('image too large (>20MB)');
+            const buf = Buffer.from(await res.arrayBuffer());
+            if (buf.length > 20 * 1024 * 1024) throw new Error('image too large (>20MB)');
+            const ctype = (res.headers.get('content-type') ?? '').split(';')[0];
+            return writeTemp(buf, ctype.split('/')[1]);
+        }
+        throw new Error(`unsupported image source: ${raw.slice(0, 48)}`);
+    }
 
     /**
      * Prepare a local image for sending: compute md5/size, ask the kernel
@@ -1324,6 +1707,35 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
     private buildActionContext(): ActionContext {
         const self = this;
         /** Log a kernel group-op response and throw when it reports failure. */
+        /** Map a kernel group member info record to the OB11 shape (NapCat parity). */
+        const memberToOb11 = (groupCode: string, info: Record<string, any>): Record<string, unknown> => {
+            const roleNum = Number(info.role ?? 0);
+            const sexNum = Number(info.sex ?? 0);
+            const qqLevel = info.qqLevel as Record<string, any> | number | undefined;
+            const qqLevelNum = Number(typeof qqLevel === 'object' ? qqLevel?.level : qqLevel);
+            const areaParts = [info.country, info.province, info.city]
+                .filter((x) => typeof x === 'string' && x) as string[];
+            return {
+                group_id: Number(groupCode) || groupCode,
+                user_id: Number(info.uin ?? 0) || String(info.uin ?? ''),
+                nickname: String(info.nick ?? ''),
+                card: String(info.cardName ?? ''),
+                sex: sexNum === 1 ? 'male' : sexNum === 2 ? 'female' : 'unknown',
+                age: Number(info.age ?? 0),
+                area: String(info.area ?? (areaParts.length ? areaParts.join(' ') : '')),
+                level: String(info.memberRealLevel ?? info.memberLevel ?? 0),
+                qq_level: Number.isFinite(qqLevelNum) ? qqLevelNum : 0,
+                join_time: Number(info.joinTime ?? 0),
+                last_sent_time: Number(info.lastSpeakTime ?? 0),
+                title: String(info.memberSpecialTitle ?? info.title ?? ''),
+                title_expire_time: 0,
+                card_changeable: true,
+                unfriendly: false,
+                is_robot: Boolean(info.isRobot),
+                shut_up_timestamp: Number(info.shutUpTime ?? 0),
+                role: roleNum === 4 ? 'owner' : roleNum === 3 ? 'admin' : 'member',
+            };
+        };
         const kernelOp = (op: string, r: unknown): void => {
             const rr = (r ?? {}) as Record<string, any>;
             const nested = rr.result && typeof rr.result === 'object' ? rr.result : null;
@@ -1389,11 +1801,11 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 return null;
             },
             resolveMsgPeer(msgId: string): { chatType: number; peerUid: string } | null {
-                return self.msgPeerCache.get(msgId) ?? null;
+                return self.msgPeerCache.get(self.canonicalMsgId(msgId)) ?? null;
             },
             async fetchMsgByMsgId(peer, msgId) {
                 const svc = self.requireServices().msg;
-                const r = await svc.getMsgsByMsgId(peer, [String(msgId)]);
+                const r = await svc.getMsgsByMsgId(peer, [self.canonicalMsgId(String(msgId))]);
                 return ((r?.result?.msgList ?? r?.msgList ?? []) as Array<Record<string, any>>)[0];
             },
             async fetchMsgBySeq(peer, seq) {
@@ -1403,32 +1815,8 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 return ((r?.result?.msgList ?? r?.msgList ?? []) as Array<Record<string, any>>)[0];
             },
             async resolveMemberNickname(groupCode, uin) {
-                const now = Date.now();
-                const cached = self.memberNickCache.get(groupCode);
-                if (cached && now - cached.at < 300_000) {
-                    return cached.byUin.get(String(uin)) ?? null;
-                }
-                try {
-                    const group = self.requireServices().group;
-                    const res = await group.getAllMemberList(groupCode, true);
-                    const result = (res?.result ?? res ?? {}) as Record<string, unknown>;
-                    const ids = (result?.ids ?? []) as Array<{ uid: string }>;
-                    const infosRaw = result?.infos as unknown;
-                    const asMap = infosRaw as Map<string, Record<string, any>>;
-                    const getInfo = (uid: string) => (typeof asMap?.get === 'function'
-                        ? asMap.get(uid)
-                        : (infosRaw as Record<string, Record<string, any>>)?.[uid]);
-                    const byUin = new Map<string, string>();
-                    for (const { uid } of ids) {
-                        const info = getInfo(uid) ?? {};
-                        const u = String(info.uin ?? '');
-                        if (u) byUin.set(u, String(info.cardName || info.nick || u));
-                    }
-                    self.memberNickCache.set(groupCode, { at: now, byUin });
-                    return byUin.get(String(uin)) ?? null;
-                } catch {
-                    return null;
-                }
+                const meta = await self.memberMeta(groupCode, uin);
+                return meta ? (meta.card || meta.nick || null) : null;
             },
             resolveUid(uid: string): string | null {
                 if (uid === self.selfUid) return self.selfUin;
@@ -1456,13 +1844,21 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 // Prepare local-file image segments before hitting the kernel.
                 for (let i = 0; i < elements.length; i++) {
                     const el = elements[i] as Record<string, unknown>;
-                    const pic = el?.picElement as Record<string, unknown> | undefined;
+                    if (el?.elementType !== 2) continue;
+                    const pic = el.picElement as Record<string, unknown> | undefined;
                     const src = String(pic?.sourcePath ?? '');
-                    if (el?.elementType === 2 && src && !src.includes('/') === false && src.startsWith('/')) {
-                        try {
-                            elements[i] = await self.prepareImageElement(src) as never;
-                        } catch { /* keep original element */ }
+                    if (!src) continue;
+                    // Paths, data:/base64:/file:/http(s) URLs, bare base64.
+                    let local: string;
+                    try {
+                        local = await self.materializeImageSource(src);
+                    } catch (e) {
+                        // Some clients send file=<name> plus a separate url.
+                        const alt = String(pic?.picSubUrl ?? '');
+                        if (!alt || alt === src) throw e;
+                        local = await self.materializeImageSource(alt);
                     }
+                    elements[i] = await self.prepareImageElement(local) as never;
                 }
                 let msgId = '';
                 try {
@@ -1494,66 +1890,30 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 const real = await realId;
                 const finalId = real || String(r?.result?.msgId ?? msgId);
                 // cache for message_id-only actions (recall/get_msg)
+                self.rememberMsgId(finalId);
                 self.msgPeerCache.set(finalId, { chatType: peer.chatType, peerUid: peer.peerUid });
                 return { msgId: finalId };
             },
             async deleteMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
-                // kernel: recallMsg(peer, msgIds[]) — log raw return for diagnosis
-                const r = await svc.recallMsg(peer, [msgId]);
+                // kernel: recallMsg(peer, msgIds[])
+                await svc.recallMsg(peer, [self.canonicalMsgId(msgId)]);
             },
             async getMsg(peer, msgId) {
                 const svc = self.requireServices().msg;
-                const r = await svc.getMsgsByMsgId(peer, [msgId]);
-                const raw = (r?.result?.msgList ?? r?.msgList ?? [])[0] as RawMessage | undefined;
-                if (!raw) throw new Error('message not found');
-                const segments = await ntElementsToSegments(
-                    (raw.elements ?? []) as Array<Record<string, unknown>>,
-                    {
-                        resolveUid: (uid) => self.uidToUin.get(uid) ?? null,
-                        selfUid: self.selfUid,
-                        peer,
-                        resolveReplyId: (p2, seq) => self.resolveReplyLocalId(p2, seq),
-                        msgId: String(raw.msgId ?? ''),
-                        rememberMedia: (key, meta) => self.rememberMediaElement(key, meta),
-                    },
-                );
-                return {
-                    message_id: String(raw.msgId ?? msgId),
-                    real_id: Number(raw.msgSeq ?? 0),
-                    sender: { user_id: String(raw.senderUin ?? '') },
-                    time: Number(raw.msgTime ?? 0),
-                    message: segments,
-                    raw_message: segmentsToRawText(segments as OB11Segment[]),
-                };
+                const id = self.canonicalMsgId(msgId);
+                const r = await svc.getMsgsByMsgId(peer, [id]);
+                const raw = ((r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[])[0];
+                if (!raw) throw self.msgNotFoundError(String(msgId));
+                return await self.buildOB11Message(raw);
             },
             async getMsgHistory(peer, msgId, count) {
                 const svc = self.requireServices().msg;
                 // kernel: getMsgsIncludeSelf(peer, startMsgId, count, isReverseOrder)
-                const r = await svc.getMsgsIncludeSelf(peer, msgId, count, false);
-                const list = (r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[];
+                const r = await svc.getMsgsIncludeSelf(peer, self.canonicalMsgId(msgId), count, false);
+                const list = ((r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[]);
                 const out: Array<Record<string, unknown>> = [];
-                for (const raw of list) {
-                    const segments = await ntElementsToSegments(
-                        (raw.elements ?? []) as Array<Record<string, unknown>>,
-                        {
-                            resolveUid: (uid) => self.uidToUin.get(uid) ?? null,
-                            selfUid: self.selfUid,
-                            peer,
-                            resolveReplyId: (p2, seq) => self.resolveReplyLocalId(p2, seq),
-                            msgId: String(raw.msgId ?? ''),
-                            rememberMedia: (key, meta) => self.rememberMediaElement(key, meta),
-                        },
-                    );
-                    out.push({
-                        message_id: String(raw.msgId ?? ''),
-                        real_id: Number(raw.msgSeq ?? 0),
-                        sender: { user_id: String(raw.senderUin ?? '') },
-                        time: Number(raw.msgTime ?? 0),
-                        message: segments,
-                        raw_message: segmentsToRawText(segments as OB11Segment[]),
-                    });
-                }
+                for (const raw of list) out.push(await self.buildOB11Message(raw));
                 return out;
             },
             async markRead(peer) {
@@ -1561,63 +1921,133 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 await svc.setMsgRead(peer);
             },
             async getLoginInfo() {
-                return { user_id: self.selfUin, nickname: self.selfNick };
+                return { user_id: Number(self.selfUin), nickname: self.selfNick };
             },
             async getFriendList() {
                 const buddy = self.requireServices().buddy;
                 const profile = self.requireServices().profile;
-                // categories: [{buddyUids: [...]}] -> profile.getCoreAndBaseInfo('nodeStore', uids)
                 let uids: string[] = [];
                 try {
                     const res = await buddy.getBuddyListV2('0', true, 0);
                     const cats = res?.data ?? [];
                     for (const cat of cats) for (const u of cat.buddyUids ?? []) uids.push(String(u));
                 } catch { /* empty */ }
-                const out: Array<Record<string, unknown>> = [];
+                // Bulk profile info: the kernel returns Map<uid, {coreInfo,
+                // baseInfo}> directly (not {result:{info}}).
+                const infoMap = new Map<string, Record<string, any>>();
                 if (uids.length > 0) {
                     try {
-                        const res = await profile.getCoreAndBaseInfo('nodeStore', uids);
-                        const infoMap = (res?.result?.info ?? res?.info ?? {}) as unknown;
-                        const getInfo = (uid: string): Record<string, any> | undefined => {
-                            if (!infoMap) return undefined;
-                            const m = infoMap as Map<string, Record<string, any>>;
-                            if (typeof m.get === 'function') return m.get(uid);
-                            return (infoMap as Record<string, Record<string, any>>)[uid];
-                        };
-                        for (const uid of uids) {
-                            const info = getInfo(uid) ?? {};
-                            const core = (info.coreInfo ?? {}) as Record<string, unknown>;
-                            const uin = String(core.uin ?? info.uin ?? '');
-                            if (uin && uin !== '0') {
-                                self.uidToUin.set(uid, uin);
-                                self.uinToUid.set(uin, uid);
+                        const res = (await profile.getCoreAndBaseInfo('nodeStore', uids)) as any;
+                        const raw: any = res instanceof Map ? res : (res?.result?.info ?? res?.info ?? res);
+                        if (raw instanceof Map) {
+                            for (const [uid, info] of raw) infoMap.set(String(uid), info as Record<string, any>);
+                        } else if (raw && typeof raw === 'object') {
+                            for (const [uid, info] of Object.entries(raw as Record<string, Record<string, any>>)) {
+                                infoMap.set(String(uid), info);
                             }
-                            out.push({
-                                user_id: uin || self.uidToUin.get(uid) || uid,
-                                nickname: String(core.nick ?? info.nick ?? ''),
-                                remark: String(info.remark ?? ''),
-                            });
                         }
-                    } catch { /* fall through */ }
+                    } catch { /* per-uid fallback below */ }
+                }
+                const detailOf = async (uid: string): Promise<Record<string, any> | undefined> => {
+                    const bulk = infoMap.get(uid);
+                    if (bulk?.coreInfo) return bulk;
+                    const uin = /^\d+$/.test(uid) ? uid : await self.uinOfUid(uid);
+                    if (!uin) return undefined;
+                    try {
+                        const d = await profile.getUserDetailInfoByUin(uin);
+                        const info = (d?.detail?.simpleInfo ?? d) as Record<string, any>;
+                        if (info?.coreInfo) return info;
+                        return { coreInfo: { uin, nick: '' } } as Record<string, any>;
+                    } catch {
+                        return undefined;
+                    }
+                };
+                const build = (uid: string, info: Record<string, any> | undefined) => {
+                    const core = (info?.coreInfo ?? {}) as Record<string, any>;
+                    const base = (info?.baseInfo ?? {}) as Record<string, any>;
+                    const resolvedUin = String(core.uin ?? info?.uin ?? self.uidToUin.get(uid) ?? '');
+                    if (uid.startsWith('u_') && resolvedUin && resolvedUin !== '0') {
+                        self.uidToUin.set(uid, resolvedUin);
+                        self.uinToUid.set(resolvedUin, uid);
+                    }
+                    const sexNum = Number(base.sex ?? 0);
+                    return {
+                        user_id: Number(resolvedUin) || resolvedUin,
+                        nickname: String(core.nick ?? ''),
+                        remark: String(core.remark ?? core.nick ?? ''),
+                        sex: sexNum === 1 ? 'male' : sexNum === 2 ? 'female' : 'unknown',
+                        age: Number(base.age ?? 0),
+                        birthday_year: Number(base.birthday_year ?? base.birthdayYear ?? 0),
+                        birthday_month: Number(base.birthday_month ?? base.birthdayMonth ?? 0),
+                        birthday_day: Number(base.birthday_day ?? base.birthdayDay ?? 0),
+                        phone_num: String(base.phoneNum ?? ''),
+                        email: String(base.eMail ?? ''),
+                        category_id: Number(base.categoryId ?? 0),
+                        level: 0,
+                    };
+                };
+                const out: Array<Record<string, unknown>> = [];
+                for (let i = 0; i < uids.length; i += 8) {
+                    const batch = uids.slice(i, i + 8);
+                    const details = await Promise.all(batch.map(detailOf));
+                    for (let j = 0; j < batch.length; j++) {
+                        const entry = build(batch[j], details[j]);
+                        // Drop entries we could not resolve to a numeric uin
+                        // (self and stale uid-only records) — OB11 clients
+                        // require numeric user_id.
+                        if (typeof entry.user_id === 'number' && entry.user_id !== Number(self.selfUin)) out.push(entry);
+                    }
                 }
                 return out;
             },
             async getStrangerInfo(userUid) {
                 const profile = self.requireServices().profile;
-                // kernel: getUserSimpleInfo(force, uids[]) — returns Map keyed by uid
-                const res = await profile.getUserSimpleInfo(true, [userUid]);
-                const infoMap = (res?.result?.info ?? res?.info ?? res) as Record<string, Record<string, unknown>> | Map<string, Record<string, unknown>>;
-                let info: Record<string, unknown> | undefined;
-                if (infoMap instanceof Map) info = infoMap.get(userUid);
-                else if (infoMap && typeof infoMap === 'object') {
-                    info = (infoMap as Record<string, Record<string, unknown>>)[userUid]
-                        ?? Object.values(infoMap as Record<string, Record<string, unknown>>)[0];
+                const uin = self.uidToUin.get(userUid) ?? '';
+                let detail: Record<string, any> | undefined;
+                let byUin: Record<string, any> | undefined;
+                try { detail = (await profile.getUserDetailInfo?.(userUid)) as Record<string, any>; } catch { /* ignore */ }
+                if (uin && typeof profile.getUserDetailInfoByUin === 'function') {
+                    try { byUin = (await profile.getUserDetailInfoByUin(uin)) as Record<string, any>; } catch { /* ignore */ }
                 }
-                const core = ((info as Record<string, any>)?.coreInfo ?? info ?? {}) as Record<string, unknown>;
-                const base = ((info as Record<string, any>)?.baseInfo ?? {}) as Record<string, unknown>;
+                const simple = (byUin?.detail?.simpleInfo ?? {}) as Record<string, any>;
+                const common = (byUin?.detail?.commonExt ?? {}) as Record<string, any>;
+                const core = (simple.coreInfo ?? (detail as any)?.coreInfo ?? {}) as Record<string, any>;
+                const base = (simple.baseInfo ?? (detail as any)?.baseInfo ?? {}) as Record<string, any>;
+                const vas = (simple.vasInfo ?? {}) as Record<string, any>;
+                const status = (simple.status ?? {}) as Record<string, any>;
+                let userId = String(uin || byUin?.detail?.uin || core.uin || '');
+                let nickname = String(core.nick ?? (detail as any)?.nick ?? '');
+                if (!nickname) {
+                    // Fallback: bulk core/base info (Map<uid, {coreInfo}>).
+                    try {
+                        const res = (await profile.getCoreAndBaseInfo('nodeStore', [userUid])) as any;
+                        const raw: any = res instanceof Map ? res : (res?.result?.info ?? res?.info ?? res);
+                        const info = raw instanceof Map ? raw.get(userUid) : raw?.[userUid];
+                        const c = (info?.coreInfo ?? {}) as Record<string, any>;
+                        nickname = String(c.nick ?? '');
+                        userId = userId || String(c.uin ?? '');
+                    } catch { /* ignore */ }
+                }
+                const sexNum = Number(base.sex ?? (detail as any)?.sex ?? 0);
+                const qqLevel = (common.qqLevel ?? (detail as any)?.qqLevel) as Record<string, any> | number | undefined;
+                const qqLevelNum = Number(typeof qqLevel === 'object' ? qqLevel?.level : qqLevel);
+                const asId = (v: string): number | string => (Number(v) > 0 ? Number(v) : v);
                 return {
-                    user_id: String(core.uin ?? base.uin ?? self.uidToUin.get(userUid) ?? ''),
-                    nickname: String(core.nick ?? base.nick ?? ''),
+                    user_id: asId(userId),
+                    uid: userUid,
+                    nickname,
+                    age: Number(base.age ?? (detail as any)?.age ?? 0),
+                    qid: String(base.qid ?? (detail as any)?.qid ?? ''),
+                    qq_level: Number.isFinite(qqLevelNum) ? qqLevelNum : 0,
+                    sex: sexNum === 1 ? 'male' : sexNum === 2 ? 'female' : 'unknown',
+                    long_nick: String(base.longNick ?? (detail as any)?.longNick ?? ''),
+                    reg_time: Number(common.regTime ?? (detail as any)?.regTime ?? 0),
+                    is_vip: Boolean(vas.svipFlag ?? false),
+                    is_years_vip: Boolean(vas.yearVipFlag ?? false),
+                    vip_level: Number(vas.vipLevel ?? 0),
+                    remark: String(core.remark ?? (detail as any)?.remark ?? ''),
+                    status: Number(status.status ?? (detail as any)?.status ?? 0),
+                    login_days: 0,
                 };
             },
             async sendLike(userUid, times) {
@@ -1625,7 +2055,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 await like.setBuddyProfileLike({
                     friendUid: userUid,
                     sourceId: 71,
-                    doLikeCount: Math.min(Math.max(times, 1), 20),
+                    doLikeCount: Math.min(Math.max(times, 1), 10),
                     doLikeTollCount: 0,
                 });
             },
@@ -1647,12 +2077,14 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 const group = self.requireServices().group;
                 // kernel signature: getGroupDetailInfo(groupCode, source); KDATACARD = 2
                 const res = await group.getGroupDetailInfo(groupCode, 2);
-                const g = (res?.result ?? res) as Record<string, unknown>;
+                const g = (res?.result ?? res) as Record<string, any>;
                 return {
-                    group_id: String(g.groupCode ?? groupCode),
+                    group_id: Number(g.groupCode ?? groupCode) || groupCode,
                     group_name: String(g.groupName ?? ''),
                     member_count: Number(g.memberCount ?? 0),
                     max_member_count: Number(g.maxMember ?? 0),
+                    group_all_shut: Number(g.groupShutupExpireTime ?? 0) > 0 ? -1 : 0,
+                    group_remark: String(g.remarkName ?? ''),
                 };
             },
             async getGroupMemberList(groupCode) {
@@ -1672,27 +2104,25 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                     }
                     return (infosRaw as Record<string, Record<string, unknown>>)[uid];
                 };
-                let harvested = 0;
+                const byUin = new Map<string, { nick: string; card: string; role: string }>();
+                const out: Array<Record<string, unknown>> = [];
                 for (const { uid } of ids) {
                     const info = infosGet(uid) ?? {};
                     const uin = String(info.uin ?? '');
                     if (uid && uin && uin !== '0') {
                         self.uidToUin.set(uid, uin);
                         self.uinToUid.set(uin, uid);
-                        harvested++;
+                        const roleNum = Number(info.role ?? 0);
+                        byUin.set(uin, {
+                            nick: String(info.nick ?? ''),
+                            card: String(info.cardName ?? ''),
+                            role: roleNum === 4 ? 'owner' : roleNum === 3 ? 'admin' : 'member',
+                        });
                     }
+                    out.push(memberToOb11(groupCode, info));
                 }
-                console.error(`[members-harvest] ids=${ids.length} harvested=${harvested} sample=`, JSON.stringify(infosGet(ids[0]?.uid ?? ''))?.slice(0, 300));
-                return ids.map(({ uid }) => {
-                    const info = infosGet(uid) ?? {};
-                    const roleNum = Number(info.role ?? 0);
-                    return {
-                        user_id: String(info.uin ?? self.uidToUin.get(uid) ?? ''),
-                        nickname: String(info.nick ?? ''),
-                        card: String(info.cardName ?? ''),
-                        role: roleNum === 1 ? 'owner' : roleNum === 2 ? 'admin' : 'member',
-                    };
-                });
+                self.memberInfoCache.set(String(groupCode), { at: Date.now(), byUin });
+                return out;
             },
             async getGroupMemberInfo(groupCode, memberUid) {
                 const group = self.requireServices().group;
@@ -1706,15 +2136,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                     ? asMap.get(memberUid)
                     : (infosRaw as Record<string, Record<string, unknown>>)?.[memberUid]) as Record<string, unknown> | undefined;
                 if (!mem) throw new Error('member not found');
-                const roleNum = Number(mem.role ?? 0);
-                return {
-                    user_id: String(mem.uin ?? self.uidToUin.get(memberUid) ?? ''),
-                    nickname: String(mem.nick ?? ''),
-                    card: String(mem.cardName ?? ''),
-                    role: roleNum === 1 ? 'owner' : roleNum === 2 ? 'admin' : 'member',
-                    level: Number(mem.level ?? 0),
-                    title: String(mem.title ?? ''),
-                };
+                return memberToOb11(groupCode, mem);
             },
             async setGroupBan(groupCode, memberUid, durationSec) {
                 const group = self.requireServices().group;
@@ -1751,7 +2173,14 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             },
             async handleFriendRequest(flag, accept) {
                 const buddy = self.requireServices().buddy;
-                await buddy.approvalFriendRequest({ friendUid: flag, reqTime: String(flag), accept });
+                // flag is the request's reqTime (as emitted in the request
+                // event); the kernel needs the requester's uid too.
+                const cached = self.friendReqCache.get(String(flag));
+                const friendUid = cached?.uid ?? (/^u_/.test(flag) ? flag : '');
+                const reqTime = cached?.reqTime ?? flag;
+                if (!friendUid) throw new Error(`unknown friend request flag ${flag}`);
+                await buddy.approvalFriendRequest({ friendUid, reqTime, accept });
+                self.friendReqCache.delete(String(flag));
             },
             async handleGroupRequest(flag, accept, reason) {
                 const group = self.requireServices().group;
@@ -1761,12 +2190,13 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             async sendPoke(targetUin, peerUin, isGroup) {
                 return await self.sendPoke(Number(targetUin), Number(peerUin), isGroup);
             },
-            async getForwardMsg(msgId) {
+            async getForwardMsg(rawMsgId) {
                 const svc = self.requireServices().msg;
-                const cachedPeer = self.msgPeerCache.get(String(msgId));
+                const msgId = self.canonicalMsgId(String(rawMsgId));
+                const cachedPeer = self.msgPeerCache.get(msgId);
                 if (!cachedPeer) throw new Error('cannot resolve message peer (forward message not seen by this session)');
                 const fPeer = { chatType: cachedPeer.chatType, peerUid: cachedPeer.peerUid, guildId: '' };
-                const rootRes = await svc.getMsgsByMsgId(fPeer, [String(msgId)]);
+                const rootRes = await svc.getMsgsByMsgId(fPeer, [msgId]);
                 const root = ((rootRes?.result?.msgList ?? rootRes?.msgList ?? []) as Array<Record<string, any>>)[0];
                 if (!root) throw new Error('forward message not found');
                 const rootId = String(root.msgId);
@@ -1783,15 +2213,15 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                             msgId: String(m.msgId ?? ''),
                             rememberMedia: (key, meta) => self.rememberMediaElement(key, meta),
                         });
+                        const senderUin = String(m.senderUin ?? self.uidToUin.get(String(m.senderUid ?? '')) ?? '');
                         nodes.push({
-                            type: 'node',
-                            data: {
-                                user_id: String(m.senderUin ?? self.uidToUin.get(String(m.senderUid ?? '')) ?? ''),
+                            sender: {
+                                user_id: Number(senderUin) || senderUin,
                                 nickname: String(m.senderNick ?? ''),
-                                time: Number(m.msgTime ?? 0),
-                                message: segs,
-                                content: segs,
                             },
+                            time: Number(m.msgTime ?? 0),
+                            message: segs,
+                            content: segs,
                         });
                         const hasNested = ((m.elements ?? []) as Array<Record<string, any>>).some((el) => !!el?.multiForwardMsgElement);
                         if (hasNested) await walk(String(m.msgId ?? ''), depth + 1);
@@ -1816,26 +2246,25 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                     try {
                         const r = await group.getGroupHonorList(req);
                         const code = Number(r?.errCode ?? r?.result?.errCode ?? 0);
-                        console.error('[honor-info]', JSON.stringify(req), '->', JSON.stringify(r)?.slice(0, 300));
                         if (code === 0) { res = r; break; }
-                    } catch (e) {
-                        console.error('[honor-info] variant failed', JSON.stringify(req), e instanceof Error ? e.message : e);
-                    }
+                    } catch { /* try next shape */ }
                 }
+                if (!res) console.error('[honor-info] kernel rejected all request shapes for group', groupCode);
                 const raw = (res?.result ?? res ?? {}) as Record<string, any>;
                 const list: Array<Record<string, any>> = Array.isArray(raw)
                     ? raw as unknown as Array<Record<string, any>>
                     : ((raw.honorList ?? raw.list ?? raw.honors ?? []) as Array<Record<string, any>>);
                 const mapHonor = (items: Array<Record<string, any>>) => items.map((it) => ({
-                    user_id: String(it?.uin ?? it?.user_id ?? ''),
+                    user_id: Number(it?.uin ?? it?.user_id ?? 0) || 0,
                     nickname: String(it?.name ?? it?.nickname ?? ''),
                     avatar: String(it?.avatar ?? ''),
                     description: String(it?.desc ?? it?.description ?? ''),
                 }));
                 const pick = (t: number) => mapHonor(list.filter((it) => Number(it?.type ?? it?.honorType ?? -1) === t));
+                const talkative = pick(1);
                 return {
-                    current_talkative: pick(1)[0] ?? {},
-                    talkative_list: pick(1),
+                    ...(talkative[0] ? { current_talkative: { ...talkative[0], day_count: 0 } } : {}),
+                    talkative_list: talkative,
                     performer_list: pick(2),
                     legend_list: pick(3),
                     emotion_list: pick(6),
@@ -1847,7 +2276,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 let cookies = '';
                 try {
                     const r = await misc.getCookies(String(domain ?? ''));
-                    cookies = String(r?.result?.cookies ?? '');
+                    cookies = String(r?.result?.cookies ?? r?.cookies ?? '');
                 } catch { /* cookies unavailable on this build */ }
                 const m = /(?:^|;\s*)skey=([^;]+)/.exec(cookies);
                 let token = 0;
@@ -1884,7 +2313,8 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                     try {
                         outFile = await self.downloadRichMedia(meta, 8_000);
                     } catch (e) {
-                        console.error('[get_media] kernel download failed:', e instanceof Error ? e.message : e);
+                        console.error('[get_media] kernel download failed:', e instanceof Error ? e.message : e,
+                            'meta', JSON.stringify({ msgId: meta.msgId, elementId: meta.elementId, chatType: meta.peer.chatType }));
                         if (meta.url) return urlFallback();
                         throw e;
                     }
@@ -1929,7 +2359,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             },
             async cleanCache() {
                 self.msgPeerCache.clear();
-                self.memberNickCache.clear();
+                self.memberInfoCache.clear();
                 self.mediaIndex.clear();
                 if (self.downloadTempPath && fs.existsSync(self.downloadTempPath)) {
                     for (const entry of fs.readdirSync(self.downloadTempPath)) {
@@ -1938,11 +2368,11 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 }
                 return { cleared: true };
             },
-            async getCookies(_domain) {
+            async getCookies(domain) {
                 const misc = self.requireServices().misc;
                 try {
-                    const r = await misc.getCookies('');
-                    return String(r?.result?.cookies ?? '');
+                    const r = await misc.getCookies(String(domain ?? ''));
+                    return String(r?.result?.cookies ?? r?.cookies ?? '');
                 } catch {
                     return '';
                 }

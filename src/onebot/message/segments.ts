@@ -389,3 +389,97 @@ export async function ntElementsToSegments(
     }
     return out;
 }
+
+/** Escape a text value for CQ-code raw_message (go-cqhttp rules). */
+function escapeCQText(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/\[/g, '&#91;').replace(/\]/g, '&#93;');
+}
+
+/**
+ * Render OB11 segments as a CQ-code string, matching go-cqhttp/NapCat's
+ * `raw_message` format (e.g. "hi[CQ:at,qq=123] [CQ:image,file=x.jpg]").
+ */
+export function segmentsToCQCode(segments: OB11Segment[]): string {
+    let out = '';
+    for (const seg of segments) {
+        if (!seg || typeof seg !== 'object') continue;
+        const d = seg.data ?? {};
+        switch (seg.type) {
+            case 'text':
+                out += escapeCQText(String(d.text ?? ''));
+                break;
+            case 'at':
+                out += `[CQ:at,qq=${String(d.qq ?? '')}]`;
+                break;
+            case 'face':
+                out += `[CQ:face,id=${String(d.id ?? '')}]`;
+                break;
+            case 'image':
+                out += `[CQ:image,file=${String(d.file ?? '')}${d.url ? `,url=${String(d.url)}` : ''}]`;
+                break;
+            case 'record':
+                out += `[CQ:record,file=${String(d.file ?? '')}${d.url ? `,url=${String(d.url)}` : ''}]`;
+                break;
+            case 'reply':
+                out += `[CQ:reply,id=${String(d.id ?? d.seq ?? '')}]`;
+                break;
+            case 'json':
+                out += `[CQ:json,data=${escapeCQText(String(d.data ?? '')).replace(/,/g, '&#44;')}]`;
+                break;
+            case 'file':
+                out += `[CQ:file,file=${String(d.file ?? '')}]`;
+                break;
+            default:
+                out += `[CQ:${seg.type}]`;
+                break;
+        }
+    }
+    return out.trim();
+}
+
+/** Undo CQ text escaping (&amp; &#91; &#93; &#44;). */
+function unescapeCQText(s: string): string {
+    return s
+        .replace(/&#44;/g, ',')
+        .replace(/&#91;/g, '[')
+        .replace(/&#93;/g, ']')
+        .replace(/&amp;/g, '&');
+}
+
+/**
+ * Parse a CQ-code string into OB11 segments (go-cqhttp/NapCat behavior for
+ * string `message` params when `auto_escape` is false).
+ */
+export function parseCQCode(text: string): OB11Segment[] {
+    const out: OB11Segment[] = [];
+    const re = /\[CQ:([A-Za-z0-9_.-]+)((?:,[^\]]*)?)\]/g;
+    let last = 0;
+    let m: RegExpExecArray | null;
+    const pushText = (raw: string): void => {
+        if (!raw) return;
+        out.push({ type: 'text', data: { text: unescapeCQText(raw) } });
+    };
+    while ((m = re.exec(text)) !== null) {
+        pushText(text.slice(last, m.index));
+        const type = m[1];
+        const data: Record<string, unknown> = {};
+        const params = m[2] ? m[2].slice(1) : '';
+        if (/^file=data:/i.test(params)) {
+            // A raw data: URI contains commas (data:image/png;base64,<body>);
+            // keep the whole value instead of splitting it as CQ params.
+            data.file = unescapeCQText(params.slice('file='.length));
+        } else if (params) {
+            for (const pair of params.split(',')) {
+                const eq = pair.indexOf('=');
+                if (eq <= 0) continue;
+                data[pair.slice(0, eq).trim()] = unescapeCQText(pair.slice(eq + 1));
+            }
+        }
+        out.push({ type, data });
+        last = re.lastIndex;
+    }
+    pushText(text.slice(last));
+    // A plain string always yields at least one segment.
+    if (out.length === 0) out.push({ type: 'text', data: { text: unescapeCQText(text) } });
+    return out;
+}

@@ -440,7 +440,7 @@ function renderRecentEvents() {
 }
 
 function summary(e) {
-  if (e.post_type === 'message') return (e.message_type === 'group' ? '[' + e.group_id + '] ' : '') + (e.sender && e.sender.nickname ? e.sender.nickname + ': ' : '') + (e.raw_message || '');
+  if (e.post_type === 'message' || e.post_type === 'message_sent') return (e.message_type === 'group' ? '[' + e.group_id + '] ' : '') + (e.sender && e.sender.nickname ? e.sender.nickname + ': ' : '') + (e.raw_message || '');
   if (e.post_type === 'notice') return e.notice_type + (e.group_id ? ' group=' + e.group_id : '') + (e.user_id ? ' user=' + e.user_id : '');
   if (e.post_type === 'request') return e.request_type + ' user=' + (e.user_id || '');
   if (e.post_type === 'meta_event') return e.meta_event_type + (e.sub_type ? '/' + e.sub_type : '');
@@ -734,7 +734,9 @@ function renderEventList() {
   const box = $('#ev-list');
   if (!box) return;
   let items = (S.events || []).slice().reverse();
-  if (S.eventFilter !== 'all') items = items.filter((e) => e.post_type === S.eventFilter);
+  if (S.eventFilter !== 'all') items = items.filter((e) => S.eventFilter === 'message'
+    ? (e.post_type === 'message' || e.post_type === 'message_sent')
+    : e.post_type === S.eventFilter);
   if (S.eventSearch) {
     const q = S.eventSearch.toLowerCase();
     items = items.filter((e) => JSON.stringify(e).toLowerCase().includes(q));

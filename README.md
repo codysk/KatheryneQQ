@@ -14,8 +14,8 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 - **无 asar 解密、无二进制 patch**：只改明文 `resources/app/package.json` 的 `main` 字段
 - **默认进程足迹极小**：无代码 trampoline；仅 1 个 16KB 原生插件在首次 poke 时加载，改 16 字节 RELRO 表项并恢复页权限（详见 [docs/poke.md](docs/poke.md)）
 - **无 renderer 注入**：headless 直接驱动内核，QQ 渲染进程不启动
-- **消息段**：text / at / face / image / record / reply / json
-- **事件**：message / notice（撤回、戳一戳、群变动）/ request / meta_event
+- **消息段**：text / at / face / image / record / reply / json / file；字符串消息按 CQ 码解析（`auto_escape` 可关闭）；图片支持本地路径、`data:` URI、`base64://`、HTTP(S) URL
+- **事件**：message / message_sent / notice（撤回、戳一戳、群变动、群文件、群名片、禁言）/ request / meta_event，字段与 NapCat 对齐（`sender.role`、CQ `raw_message`、`message_seq`/`real_seq`、30s 心跳）
 
 ## 兼容性
 
@@ -162,6 +162,8 @@ docker run -d --name katheryne \
 
 响应 envelope 遵循 OB11 规范：`{ status, retcode, data, message?, echo }`；retcode：0 成功 / 1400 参数错误 / 1403 未授权 / 1404 动作不支持 / 1500 内部错误。
 
+`message_id` 是 19 位雪花 ID 的**十进制字符串**（JSON number 会丢精度）。若客户端仍把它转成 Number 再传回，`get_msg`/`delete_msg`/`get_msg_history` 会在最近消息中按精度误差窗口尝试还原，仅在唯一匹配时生效；多个候选或无法匹配时返回带提示的 `message not found`。
+
 ### ✅ 已实测通过（32）
 
 `send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`（真撤回）、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_card`、`set_group_name`、`set_group_avatar`、`can_send_image`、`can_send_record`、`get_version_info`、`get_status`、`get_cookies`、`get_csrf_token`、`group_poke`、`friend_poke`
@@ -172,7 +174,7 @@ docker run -d --name katheryne \
 
 | 动作 | 说明 |
 |---|---|
-| `get_forward_msg` | 实现（`getMultiMsg` 逐层解析，支持嵌套）；需被转发的消息在本会话事件中出现过；已用普通消息验证内核调用路径 |
+| `get_forward_msg` | 实现（`getMultiMsg` 逐层解析，支持嵌套）；需被转发的消息在本会话事件中出现过；已用普通消息验证内核调用路径。响应同时返回 `messages`（go-cqhttp/NapCat 对象）与 `message`（public.md 节点段），均含 `sender`/`time`/`content` |
 | `get_group_honor_info` | 实现（`getGroupHonorList`）；当前 3.2.35 构建返回 `param(group_id) error`，返回空荣誉列表 |
 | `get_record` | 实现（本地路径 / CDN URL / 内核下载，`out_format` 可用系统 ffmpeg 转换）；暂缺真实语音样本实测 |
 | `set_restart` | 实现（延迟退出进程，依赖守护进程/容器 restart 策略拉起）；会中断会话，未做破坏性实测 |
@@ -200,11 +202,42 @@ docker run -d --name katheryne \
 | `set_friend_add_request` | 需真实待处理好友申请 |
 | `set_group_add_request` | 需真实待处理加群申请 |
 
-消息过滤（与 NapCat 对齐）：启动前的历史补发消息不上报；`KMSGTYPENULL` 空消息忽略；机器人自己发送的消息默认不上报，配置 `"report_self_message": true` 可开启（`sub_type: "self"`）。
+消息过滤（与 NapCat 对齐）：启动前的历史补发消息不上报；`KMSGTYPENULL` 空消息忽略；机器人自己发送的消息默认不上报，配置 `"report_self_message": true` 后以 `post_type: "message_sent"` 上报（与普通消息共用 `buildOB11Message`，`sub_type` 为 `friend`/`normal`）。
 
 ### 事件
 
-`message`（私聊/群聊/自发）、`notice`（群增减员/禁言/踢出/群撤回/戳一戳）、`request`（好友/加群请求）、`meta_event`（lifecycle/heartbeat）。
+`message` / `message_sent`（私聊/群聊）、`notice`（群增减员、踢出、禁言/解禁、群名变更、群名片、群文件、群撤回、戳一戳、好友撤回）、`request`（好友/加群请求）、`meta_event`（`lifecycle` connect、`heartbeat`）。
+
+与 NapCat 对齐的关键字段：
+
+| 事件 | 说明 |
+|---|---|
+| `message` | `post_type` 为 `message` 或 `message_sent`；`sub_type` 为 `friend`/`normal`；`sender.role` 映射内核 role（owner/admin/member）；`raw_message` 为 CQ 码；`font: 14`；`message_seq`/`real_id` 为本地雪花 ID，`real_seq` 为内核 `msgSeq` |
+| `heartbeat` | 上线立即一次，此后每 30s（`heartbeat_interval_ms` 可调），`status: {online, good}` |
+| 戳一戳 | `notice_type: "notify"`, `sub_type: "poke"`，`user_id`/`target_id` 为 QQ 号（非 uid），私聊另有 `sender_id`，附 `raw_info` |
+| 群禁言 | `group_ban`，`sub_type: ban`/`lift_ban`，`user_id`/`operator_id` 为 QQ 号；全员禁言 `duration: -1` |
+| 群名/群名片 | `notify.group_name`（`name_new`）、`group_card`（`card_new`/`card_old`） |
+| 群文件 | `group_upload`，`file: {id, name, size, busid}`，同时消息事件内保留 `file` 段 |
+| 群请求/通知 | 按内核 `GroupNotifyMsgType` 映射为 `request group`（add/invite）与 `group_increase`/`group_decrease`/`group_admin`；`flag` 为通知 `seq` |
+
+`get_friend_list` / 陌生人 / 群成员查询均返回数字 QQ 号与完整资料：好友列表通过内核 profile 服务把 uid 解析为 uin（批量 `getCoreAndBaseInfo` 在快速登录后为空，已改为 Map 解析 + 逐 uid 回退）；`get_credentials` 返回 public.md 要求的 `{cookies, csrf_token}`。
+
+### 图片 / 表情发送
+
+`image` 段的 `file` 支持以下来源（数组消息与 CQ 字符串均可）：
+
+| 来源 | 示例 |
+|---|---|
+| 本地绝对路径 | `/tmp/a.png` |
+| `file://` | `file:///tmp/a.png` |
+| Data URI | `data:image/png;base64,iVBORw0K...` |
+| `base64://` | `base64://iVBORw0K...` |
+| 裸 base64 | 能嗅探出 PNG/JPEG/GIF/WEBP/BMP 魔数时按图片处理 |
+| HTTP(S) URL | `https://example.com/a.png`（下载到临时目录，上限 20MB） |
+| 收到的图片 `file` 名 | 若本地已缓存则直接复用；否则尝试索引的 CDN URL（QQ 的 `gchat.qpic.cn/download` 链接通常需要客户端内部下载器，建议改用本地路径/base64） |
+
+CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（逗号不会被当作参数分隔符）。
+`face` 段直接发送 QQ 小表情（如 `[CQ:face,id=14]`）；Unicode emoji 走 `text` 段。临时图片文件位于 QQ 下载目录，`clean_cache` 会一并清理。
 
 ### 扩展动作
 

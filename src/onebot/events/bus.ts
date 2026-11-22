@@ -8,7 +8,7 @@
  */
 export interface OB11Event {
     time: number;
-    self_id: string;
+    self_id: string | number;
     post_type: string;
     [k: string]: unknown;
 }
@@ -106,8 +106,13 @@ export function segmentsToRawText(segments: unknown[]): string {
 }
 
 /**
- * NT group notify types (NodeIKernelGroupListener onGroupNotifiesUpdated).
- * Kernel notify.type values mapped to OB11 sub types.
+ * NT group notify types (napcat-core GroupNotifyMsgType) mapped to OB11
+ * request/presence notices. Presence/admin are normally derived from system
+ * messages in NapCat; here we map the notify equivalents best-effort.
+ *   1 INVITED_BY_MEMBER, 4 AGREED_TOJOIN_DIRECT, 5 INVITED_NEED_ADMIN_PASS,
+ *   6 AGREED_TO_JOIN_BY_ADMIN, 7 REQUEST_JOIN_NEED_ADMIN_PASS, 8 SET_ADMIN,
+ *   9 KICK_NOTIFY_ADMIN, 10 KICK_NOTIFY_KICKED, 11 MEMBER_LEAVE,
+ *   12/13 CANCEL_ADMIN, 14/15 TRANSFER_GROUP
  */
 export function groupNotifyToNotice(
     notify: Record<string, unknown>,
@@ -115,54 +120,50 @@ export function groupNotifyToNotice(
     resolve: (uid: string) => string | null,
 ): OB11AnyEvent | null {
     const type = Number(notify.type ?? 0);
-    const groupCode = String(notify.groupCode ?? notify.group_id ?? '');
-    const user1Uid = String(notify.user1Uid ?? notify.u1Uid ?? '');
-    const user2Uid = String(notify.user2Uid ?? notify.u2Uid ?? '');
-    const user1 = user1Uid ? resolve(user1Uid) ?? user1Uid : '';
-    const user2 = user2Uid ? resolve(user2Uid) ?? user2Uid : '';
+    const status = Number(notify.status ?? 0);
+    const group = (notify.group ?? {}) as Record<string, unknown>;
+    const groupCode = String(group.groupCode ?? notify.groupCode ?? notify.group_id ?? '');
+    const uinOf = (u: unknown): string => {
+        const obj = (u ?? {}) as Record<string, unknown>;
+        const uid = String(obj.uid ?? '');
+        if (!uid || uid === '0') return '0';
+        return resolve(uid) ?? uid;
+    };
+    const user1 = uinOf(notify.user1);
+    const user2 = uinOf(notify.user2);
+    const actionUser = uinOf(notify.actionUser);
+    const operator = actionUser !== '0' ? actionUser : user2;
+    const asId = (u: string): number | string => (Number(u) > 0 ? Number(u) : u);
     const base = {
         time: Math.floor(Date.now() / 1000),
-        self_id: selfUin,
-        post_type: 'notice' as const,
-        group_id: groupCode,
+        self_id: Number(selfUin) || selfUin,
+        group_id: Number(groupCode) || groupCode,
     };
+    const comment = String(notify.postscript ?? '');
+    const flag = String(notify.seq ?? '');
+    // Requests only matter while pending (KUNHANDLE = 1).
+    const pending = status === 1;
     switch (type) {
-        case 5: // member leave (kicked or quit)
-            return { ...base, notice_type: 'group_decrease', sub_type: 'kick', operator_id: user1, user_id: user2 };
-        case 7: // member increase (approved join)
-            return { ...base, notice_type: 'group_increase', sub_type: 'approve', operator_id: '0', user_id: user1 };
-        case 10: // invited by admin
-            return { ...base, notice_type: 'group_increase', sub_type: 'invite', operator_id: user1, user_id: user2 };
-        case 12: // join request pending
-            return {
-                ...base,
-                post_type: 'request' as const,
-                request_type: 'group' as const,
-                sub_type: 'add',
-                user_id: user1,
-                comment: String(notify.postScript ?? ''),
-                flag: String(notify.seqId ?? notify.seq ?? ''),
-            };
-        case 13: // friend request via group
-            return {
-                ...base,
-                post_type: 'request' as const,
-                request_type: 'friend' as const,
-                sub_type: 'group',
-                user_id: user1,
-                comment: String(notify.postScript ?? ''),
-                flag: String(notify.seqId ?? notify.seq ?? ''),
-            };
-        case 14: // invited to group (self)
-            return {
-                ...base,
-                post_type: 'request' as const,
-                request_type: 'group' as const,
-                sub_type: 'invite',
-                user_id: user1,
-                comment: '',
-                flag: String(notify.seqId ?? notify.seq ?? ''),
-            };
+        case 7: // REQUEST_JOIN_NEED_ADMINI_STRATOR_PASS
+        case 5: // INVITED_NEED_ADMINI_STRATOR_PASS
+            if (!pending) return null;
+            return { ...base, post_type: 'request', request_type: 'group', sub_type: 'add', user_id: asId(user1), comment, flag };
+        case 1: // INVITED_BY_MEMBER (bot invited by a member)
+            if (!pending) return null;
+            return { ...base, post_type: 'request', request_type: 'group', sub_type: 'invite', user_id: asId(user2), comment, flag };
+        case 4: // AGREED_TOJOIN_DIRECT
+        case 6: // AGREED_TO_JOIN_BY_ADMINI_STRATOR
+            return { ...base, post_type: 'notice', notice_type: 'group_increase', sub_type: 'approve', user_id: asId(user1), operator_id: asId(operator) };
+        case 9: // KICK_MEMBER_NOTIFY_ADMIN
+        case 10: // KICK_MEMBER_NOTIFY_KICKED
+            return { ...base, post_type: 'notice', notice_type: 'group_decrease', sub_type: 'kick', user_id: asId(user1), operator_id: asId(operator) };
+        case 11: // MEMBER_LEAVE_NOTIFY_ADMIN
+            return { ...base, post_type: 'notice', notice_type: 'group_decrease', sub_type: 'leave', user_id: asId(user1), operator_id: 0 };
+        case 8: // SET_ADMIN
+            return { ...base, post_type: 'notice', notice_type: 'group_admin', sub_type: 'set', user_id: asId(user1) };
+        case 12: // CANCEL_ADMIN_NOTIFY_CANCELED
+        case 13: // CANCEL_ADMIN_NOTIFY_ADMIN
+            return { ...base, post_type: 'notice', notice_type: 'group_admin', sub_type: 'unset', user_id: asId(user1) };
         default:
             return null;
     }
