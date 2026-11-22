@@ -25,9 +25,6 @@ mkdir -p "$(dirname "${KATHERYNE_CONFIG:-/data/config.json}")" /data
 node /opt/katheryne/installer/install.js "$QQ_ROOT"
 
 cd "$QQ_ROOT"
-# Headless kernel driving: no renderer, no GPU. Extra args can be appended.
-# Electron may still want an X connection; fall back to Xvfb when none exists.
-if [ -z "${DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
-    exec xvfb-run -a ./qq --no-sandbox --disable-gpu --headless "$@"
-fi
+# Headless kernel driving: no renderer, no GPU (verified to boot without X).
+# Extra args can be appended to override.
 exec ./qq --no-sandbox --disable-gpu --headless "$@"

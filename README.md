@@ -89,7 +89,8 @@ KATHERYNE_CONFIG=./config.json /path/to/QQRoot/qq --no-sandbox --headless
 # 1. 宿主机解包 QQ
 ./QQ_3.2.35_x86_64.AppImage --appimage-extract   # → squashfs-root/
 
-# 2. 构建镜像
+# 2. 构建镜像（网络受限时可换 apt 镜像：
+#    --build-arg APT_MIRROR=mirrors.aliyun.com）
 docker build -t katheryneqq .
 
 # 3. 运行（首次扫码登录，之后复用 /data 里的登录记录）
