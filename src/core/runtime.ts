@@ -267,7 +267,7 @@ class KatheryneRuntime {
             onKickedOffLine: (info: { tipsTitle?: string; tipsDesc?: string }) => {
                 this.bus.emit({
                     time: Math.floor(Date.now() / 1000),
-                    self_id: this.selfUin,
+                    self_id: Number(this.selfUin) || this.selfUin,
                     post_type: 'notice',
                     notice_type: 'client_kicked_offline',
                     title: info?.tipsTitle ?? '',
@@ -354,7 +354,7 @@ class KatheryneRuntime {
             this.loginError = null;
             this.bus.emit({
                 time: Math.floor(Date.now() / 1000),
-                self_id: this.selfUin,
+                self_id: Number(this.selfUin) || this.selfUin,
                 post_type: 'meta_event',
                 meta_event_type: 'lifecycle',
                 sub_type: 'connect',
@@ -420,7 +420,7 @@ class KatheryneRuntime {
             onKickedOffLine: (info: { tipsTitle?: string; tipsDesc?: string }) => {
                 this.bus.emit({
                     time: Math.floor(Date.now() / 1000),
-                    self_id: this.selfUin,
+                    self_id: Number(this.selfUin) || this.selfUin,
                     post_type: 'notice',
                     notice_type: 'kicked_offline',
                     title: info?.tipsTitle ?? '',
@@ -497,7 +497,7 @@ class KatheryneRuntime {
             const userId = uin || this.uidToUin.get(uid) || uid;
             this.bus.emit({
                 time: Math.floor(Date.now() / 1000),
-                self_id: this.selfUin,
+                self_id: Number(this.selfUin) || this.selfUin,
                 post_type: 'request',
                 request_type: 'friend',
                 sub_type: String(r.sourceType ?? 'normal'),
@@ -641,7 +641,7 @@ class KatheryneRuntime {
         const asId = (v: string): number | string => (Number(v) > 0 ? Number(v) : v);
         this.bus.emit({
             time: Math.floor(Date.now() / 1000),
-            self_id: this.selfUin,
+            self_id: Number(this.selfUin) || this.selfUin,
             post_type: 'notice',
             notice_type: isGroup ? 'group_recall' : 'friend_recall',
             group_id: isGroup ? asId(groupUin) : undefined,
@@ -728,13 +728,16 @@ class KatheryneRuntime {
                         const memberUin = memberUid ? (await this.uinOfUid(memberUid) || memberUid) : '0';
                         const adminUin = adminUid ? (await this.uinOfUid(adminUid) || adminUid) : '0';
                         if (memberUin && adminUin) {
-                            if (!memberUid && duration > 0) duration = -1; // whole-group ban
+                            // Decide before normalizing: whole-group bans use
+                            // duration -1 in the OB11 event but are still `ban`.
+                            const isBan = duration > 0;
+                            if (!memberUid && isBan) duration = -1;
                             this.bus.emit({
                                 ...base,
                                 notice_type: 'group_ban',
-                                sub_type: duration > 0 ? 'ban' : 'lift_ban',
-                                user_id: asId(memberUin),
-                                operator_id: asId(adminUin),
+                                sub_type: isBan ? 'ban' : 'lift_ban',
+                                user_id: memberUin === '0' ? 0 : asId(memberUin),
+                                operator_id: adminUin === '0' ? 0 : asId(adminUin),
                                 duration,
                             } as never);
                         }

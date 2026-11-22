@@ -1,6 +1,6 @@
 # KatheryneQQ
 
-OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核 API（wrapper.node）驱动，无需协议实现、无需 patch QQ 二进制。
+OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核 API（wrapper.node）驱动，无需协议实现、不修改磁盘上的 QQ 二进制。
 
 [![CI](https://github.com/codysk/KatheryneQQ/actions/workflows/ci.yml/badge.svg)](https://github.com/codysk/KatheryneQQ/actions/workflows/ci.yml)
 
@@ -8,13 +8,13 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 
 ## 特性
 
-- **完整 OneBot v11 动作集**（44 个动作：38 个 public API 全量 + 6 个扩展），实测 32 个通过，详见[支持矩阵](#onebot-v11-支持矩阵)
+- **完整 OneBot v11 动作集**（44 个动作：38 个 public API 全部注册 + 6 个扩展，其中 3 个平台不支持），实测 31 个通过，详见[支持矩阵](#onebot-v11-支持矩阵)
 - **主动戳一戳可用**：经 MSF 二进制通道发送 OIDB 0xED3_1（含原生插件放行内核 cmd 白名单），群聊/私聊均实测送达，原理见 [docs/poke.md](docs/poke.md)
 - **Web 控制台**：扫码登录、事件流、动作调试器、运行日志
-- **无 asar 解密、无二进制 patch**：只改明文 `resources/app/package.json` 的 `main` 字段
-- **默认进程足迹极小**：无代码 trampoline；仅 1 个 16KB 原生插件在首次 poke 时加载，改 16 字节 RELRO 表项并恢复页权限（详见 [docs/poke.md](docs/poke.md)）
+- **无 asar 解密、不修改磁盘二进制**：只改明文 `resources/app/package.json` 的 `main` 字段
+- **默认进程足迹极小**：无代码 trampoline；仅 1 个约 17KB 的原生插件在首次 poke 时懒加载并常驻，改 16 字节 RELRO 表项并恢复页权限（详见 [docs/poke.md](docs/poke.md)）
 - **无 renderer 注入**：headless 直接驱动内核，QQ 渲染进程不启动
-- **消息段**：text / at / face / image / record / reply / json / file；字符串消息按 CQ 码解析（`auto_escape` 可关闭）；图片支持本地路径、`data:` URI、`base64://`、HTTP(S) URL
+- **消息段**：text / at / face / image / record / reply / json / file（`file` 目前只支持接收群文件消息，发送会被忽略）；字符串消息按 CQ 码解析（`auto_escape` 可关闭）；图片支持本地路径、`data:` URI、`base64://`、HTTP(S) URL
 - **事件**：message / message_sent / notice（撤回、戳一戳、群变动、群文件、群名片、禁言）/ request / meta_event，字段与 NapCat 对齐（`sender.role`、CQ `raw_message`、`message_seq`/`real_seq`、30s 心跳）
 
 ## 兼容性
@@ -22,15 +22,15 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 | 项目 | 说明 |
 |---|---|
 | 平台 | Linux x86_64（AppImage / deb / rpm） |
-| QQ 版本 | **3.2.35-54395**（已验证）。其它 3.2.x 版本消息/群管等核心能力可用；**poke 的白名单 RVA 是版本相关的**，未命中时 poke 会返回明确错误而不是静默失败 |
+| QQ 版本 | **3.2.35-54395**（已验证）。其它 3.2.x 未逐一验证，消息/群管等核心内核 API 通常可用；**poke 的白名单 RVA 是版本相关的**，未命中时动作返回 `poke send failed`，日志会说明 whitelist 原因 |
 | Node | ≥ 20（构建用；运行在 QQ 自带 Electron 内） |
-| 构建依赖 | gcc + Node 头文件（编译 16KB 原生插件） |
+| 构建依赖 | gcc + Node 头文件（编译约 17KB 的原生插件） |
 
 ## 原理
 
 QQNT Linux 版的 Electron 主进程从 `resources/app/package.json` 的 `main` 字段启动（该文件为明文，位于加密 `application.asar` 之外）。KatheryneQQ 利用这一点：
 
-1. **不改 asar、不改二进制**。安装器只把 `main` 改为 `./katheryne/boot.js`，并复制运行时文件。
+1. **不改 asar、不改磁盘二进制**。安装器只把 `main` 改为 `./katheryne/boot.js`，并复制运行时文件。
 2. QQ 启动时直接执行 KatheryneQQ 的 `boot.js` —— 此刻我们就在 QQ 自己的 Electron（node 24 / electron 40）里。
 3. `process.dlopen` 加载 QQ 自带的 `wrapper.node`（NT 内核 NAPI 绑定）与 `major.node`，通过官方内核 API 完成引擎初始化 → 登录 → 会话 → 收发消息。
 4. OneBot v11 的 WS/HTTP 服务在进程内运行，与内核事件直连。
@@ -40,7 +40,7 @@ QQNT Linux 版的 Electron 主进程从 `resources/app/package.json` 的 `main` 
 - 不 hook `process.dlopen`、不代理/包装 QQ 自己创建的 session；
 - 不解密、不替换 `application.asar`，也不修改 QQ 的 JS bundle；
 - 无 renderer/preload 注入，QQ 的渲染进程不启动；
-- 使用的全部是 QQ 原生二进制与原生模块，行为面接近官方客户端。
+- 除 poke 所需的约 17KB 自研 memsync 插件外，使用的都是 QQ 原生二进制与原生模块，行为面接近官方客户端。
 
 ## 快速开始（宿主机）
 
@@ -63,10 +63,11 @@ npm run build          # tsc + 编译原生插件 → dist/
 # 已安装 QQ：指定 QQ 根目录
 node dist/installer/install.js /path/to/QQRoot
 
-# 未安装 QQ：安装器会自动从腾讯官方下载对应版本并解包
-# （版本元数据来自官方 linuxConfig.js，默认 AppImage，存到 ~/.local/share/katheryneqq/qq/）
+# 未安装 QQ：安装器会自动从腾讯官方下载当前最新 Linux 版并解包
+# （版本以官方 linuxConfig.js 为准，不固定为 3.2.35；默认 AppImage，
+#  存到 ~/.local/share/katheryneqq/qq/）
 node dist/installer/install.js
-# 强制重新下载 / 指定镜像源：
+# 跳过已安装 QQ 检测，走官方下载（已有缓存/解包则复用）/ 指定镜像源：
 node dist/installer/install.js --download
 KATHERYNE_QQ_DOWNLOAD_URL=https://your-mirror/QQ.AppImage node dist/installer/install.js
 ```
@@ -76,7 +77,7 @@ URL（未签名的 qqdl 请求会被 403）→ 下载 → 校验 → 解包。
 相关环境变量：`KATHERYNE_QQ_DOWNLOAD_URL`（直接覆盖安装包地址）、
 `KATHERYNE_QQ_DOWNLOAD_DIR`（缓存/解包目录）、`KATHERYNE_QQ_CONFIG_URL`
 （版本元数据地址）。签名链路细节见 [docs/download.md](docs/download.md)。
-安装完成后会打印 QQ 根目录与启动命令。
+安装完成后会打印安装位置与启动命令。
 
 ### 3. 登录
 
@@ -91,13 +92,16 @@ KATHERYNE_CONFIG=./config.json /path/to/QQRoot/qq --no-sandbox --headless
 ```json
 {
   "quick_login_uin": "10000",
-  "http":  { "enabled": true, "host": "0.0.0.0", "port": 5700 },
+  "http":  { "enabled": true, "host": "0.0.0.0", "port": 5700, "access_token": "", "event_post_url": "" },
   "ws":    { "enabled": true, "host": "0.0.0.0", "port": 6700, "access_token": "" },
-  "reverseWs": { "enabled": false, "urls": ["ws://127.0.0.1:8080/"] },
+  "reverseWs": { "enabled": false, "urls": ["ws://127.0.0.1:8080/"], "access_token": "" },
   "console": { "enabled": true, "host": "0.0.0.0", "port": 6099 },
-  "report_self_message": false
+  "report_self_message": false,
+  "heartbeat_interval_ms": 30000
 }
 ```
+
+`http.event_post_url` 非空时按 HTTP POST 上报事件；`access_token` 对 HTTP（Bearer 或 query）和 WS（Bearer 或 `?access_token=`）生效；`heartbeat_interval_ms` 最小 5000。
 
 ## Docker
 
@@ -150,7 +154,7 @@ docker run -d --name katheryne \
 - **运行日志**：分级过滤、暂停、自动滚动
 - **接口调试**：动作下拉 + JSON 参数 + 结果展示 + 最近 10 条执行历史
 - **事件流**：类型过滤、全文搜索、暂停、展开原始 JSON
-- **关于**：版本信息与文档链接
+- **关于**：QQ 内核版本信息与文档链接
 
 配置了 `username`/`password` 时启用 HTTP Basic 认证。控制台 API：`/api/state`、`/api/events`、
 `/api/logs`、`/api/actions`、`/api/action`、`/api/logins`、`/api/config`（GET/POST）、
@@ -162,20 +166,23 @@ docker run -d --name katheryne \
 
 响应 envelope 遵循 OB11 规范：`{ status, retcode, data, message?, echo }`；retcode：0 成功 / 1400 参数错误 / 1403 未授权 / 1404 动作不支持 / 1500 内部错误。
 
-`message_id` 是 19 位雪花 ID 的**十进制字符串**（JSON number 会丢精度）。若客户端仍把它转成 Number 再传回，`get_msg`/`delete_msg`/`get_msg_history` 会在最近消息中按精度误差窗口尝试还原，仅在唯一匹配时生效；多个候选或无法匹配时返回带提示的 `message not found`。
+`message_id` 是 19 位雪花 ID 的**十进制字符串**（JSON number 会丢精度）。若客户端仍把它转成 Number 再传回，`get_msg`/`delete_msg`/`get_msg_history` 会先按精度误差窗口尝试还原；`get_msg` 仅在唯一匹配时成功，多个候选或无法匹配时返回带提示的 `message not found`（其余接口按内核结果处理）。
 
-### ✅ 已实测通过（32）
+### ✅ 已实测通过（31）
 
-`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`（真撤回）、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_card`、`set_group_name`、`set_group_avatar`、`can_send_image`、`can_send_record`、`get_version_info`、`get_status`、`get_cookies`、`get_csrf_token`、`group_poke`、`friend_poke`
+`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`（真撤回）、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_card`、`set_group_name`、`set_group_avatar`、`can_send_image`、`can_send_record`、`get_version_info`、`get_status`、`get_cookies`、`get_csrf_token`、`get_credentials`、`clean_cache`、`group_poke`、`friend_poke`
 
-群管理类均做过可逆恢复验证（禁言→解禁、改名→改回、换头像→恢复原图）；内核返回非 0 时动作会正确报错（错误码透传）。
+群管理类均做过可逆恢复验证（禁言→解禁、改名→改回、换头像→恢复原图）；内核返回非 0 时动作会失败，错误信息包含内核 code（OB11 retcode 为 1500）。
 
-### ◻️ 已实现、受限或未实测（4）
+`get_cookies` / `get_credentials` 的响应结构符合规范；在没有 Web cookies 缓存的快速登录会话中，内核可能返回空 cookies 与 `csrf_token: 0`（`get_csrf_token` 固定返回 0）。
+
+### ◻️ 已实现、受限或未实测（5）
 
 | 动作 | 说明 |
 |---|---|
-| `get_forward_msg` | 实现（`getMultiMsg` 逐层解析，支持嵌套）；需被转发的消息在本会话事件中出现过；已用普通消息验证内核调用路径。响应同时返回 `messages`（go-cqhttp/NapCat 对象）与 `message`（public.md 节点段），均含 `sender`/`time`/`content` |
+| `get_forward_msg` | 实现（`getMultiMsg` 递归读取嵌套转发，结果按节点平铺返回）；需被转发的消息在本会话事件中出现过；已用普通消息验证内核调用路径。响应同时返回 `messages`（go-cqhttp/NapCat 的 `sender`/`time`/`content` 对象）与 `message`（public.md 的 `node` 段，字段在 `data.user_id`/`nickname`/`time`/`content`） |
 | `get_group_honor_info` | 实现（`getGroupHonorList`）；当前 3.2.35 构建返回 `param(group_id) error`，返回空荣誉列表 |
+| `get_image` | 实现（本地路径 / URL / 内核 `downloadRichMedia`）；本地已缓存的图片可返回路径；接收图片未缓存时当前 3.2.35 内核下载常超时，会回退返回 CDN URL（此路径下 `file` 不是本地路径） |
 | `get_record` | 实现（本地路径 / CDN URL / 内核下载，`out_format` 可用系统 ffmpeg 转换）；暂缺真实语音样本实测 |
 | `set_restart` | 实现（延迟退出进程，依赖守护进程/容器 restart 策略拉起）；会中断会话，未做破坏性实测 |
 
@@ -183,9 +190,9 @@ docker run -d --name katheryne \
 
 | 动作 | 原因 |
 |---|---|
-| `set_group_anonymous` | QQNT 内核无匿名群相关 API（NapCat 同样未实现） |
+| `set_group_anonymous` | QQNT 内核无匿名群相关 API |
 | `set_group_anonymous_ban` | 同上 |
-| `set_group_special_title` | QQNT 内核无群头衔设置 API（NapCat 同样未实现） |
+| `set_group_special_title` | QQNT 内核无群头衔设置 API |
 
 ### ⚠️ 权限受限（1）
 
@@ -212,15 +219,19 @@ docker run -d --name katheryne \
 
 | 事件 | 说明 |
 |---|---|
-| `message` | `post_type` 为 `message` 或 `message_sent`；`sub_type` 为 `friend`/`normal`；`sender.role` 映射内核 role（owner/admin/member）；`raw_message` 为 CQ 码；`font: 14`；`message_seq`/`real_id` 为本地雪花 ID，`real_seq` 为内核 `msgSeq` |
+| `message` | `post_type` 为 `message` 或 `message_sent`；`sub_type` 为 `friend`/`normal`；群聊 `sender.role` 映射内核 role（owner/admin/member）；`raw_message` 为 CQ 码；`font: 14`；`message_seq`/`real_id` 为本地雪花 ID，`real_seq` 为内核 `msgSeq` |
 | `heartbeat` | 上线立即一次，此后每 30s（`heartbeat_interval_ms` 可调），`status: {online, good}` |
-| 戳一戳 | `notice_type: "notify"`, `sub_type: "poke"`，`user_id`/`target_id` 为 QQ 号（非 uid），私聊另有 `sender_id`，附 `raw_info` |
-| 群禁言 | `group_ban`，`sub_type: ban`/`lift_ban`，`user_id`/`operator_id` 为 QQ 号；全员禁言 `duration: -1` |
-| 群名/群名片 | `notify.group_name`（`name_new`）、`group_card`（`card_new`/`card_old`） |
-| 群文件 | `group_upload`，`file: {id, name, size, busid}`，同时消息事件内保留 `file` 段 |
-| 群请求/通知 | 按内核 `GroupNotifyMsgType` 映射为 `request group`（add/invite）与 `group_increase`/`group_decrease`/`group_admin`；`flag` 为通知 `seq` |
+| 戳一戳（WS 事件格式未实测） | `notice_type: "notify"`, `sub_type: "poke"`，`user_id`/`target_id` 目标为 QQ 号（非 uid），私聊另有 `sender_id`，附 `raw_info`；发送侧群聊/私聊已验证送达，接收侧格式待一次真实 poke 复核 |
+| 群禁言 | `group_ban`，`sub_type: ban`/`lift_ban`，`user_id`/`operator_id` 为数字 QQ 号；全员禁言 `user_id: 0`、`duration: -1`，解除为 `duration: 0` |
+| 群名/群名片 | `notify.group_name`（`name_new`，已实测）、`group_card`（`card_new`/`card_old`，未实测） |
+| 群文件（未实测） | `group_upload`，`file: {id, name, size, busid}`，同时消息事件内保留 `file` 段；尚无真实群文件上传样本 |
+| 群请求/通知（未实测） | 按内核 `GroupNotifyMsgType` 映射为 `request group`（add/invite）与 `group_increase`/`group_decrease`/`group_admin`；`flag` 为通知 `seq`；尚无真实申请/入群/踢人样本 |
 
-`get_friend_list` / 陌生人 / 群成员查询均返回数字 QQ 号与完整资料：好友列表通过内核 profile 服务把 uid 解析为 uin（批量 `getCoreAndBaseInfo` 在快速登录后为空，已改为 Map 解析 + 逐 uid 回退）；`get_credentials` 返回 public.md 要求的 `{cookies, csrf_token}`。
+事件中的 QQ 号字段会优先解析为数字 uin；极少数解析失败时回退为 uid 字符串。
+
+> ⚠️ 未实测标注：`group_card`、`group_upload`、好友/加群请求及 `group_increase`/`group_decrease`/`group_admin` 事件为代码路径已实现、字段按内核结构与 NapCat 格式编写，但尚无真实样本验证；poke 的 WS 接收事件同样待一次真实 poke 复核。
+
+`get_friend_list` / 陌生人 / 群成员查询均返回数字 QQ 号与完整资料：好友列表通过内核 profile 服务把 uid 解析为 uin（批量 `getCoreAndBaseInfo` 返回 `Map<uid,{coreInfo,baseInfo}>`，按普通对象读取会得到空表；现已按 Map 解析，并保留逐 uid 回退）；`get_credentials` 返回 public.md 要求的 `{cookies, csrf_token}`。
 
 ### 图片 / 表情发送
 
@@ -252,8 +263,8 @@ CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（�
 | 启动即崩溃（SIGTRAP/SIGSEGV），日志有 `Couldn't mmap icu data file` | QQ 根目录在 DrvFS/9p 等网络盘上（如 WSL 的 `/mnt/d`）。把 QQ 根目录放到本地 ext4（如 `/tmp` 或容器卷）再运行 |
 | 进程被 SIGPIPE 杀死（signal 13） | QQ 的 Bugly 崩溃处理会写已关闭的 stdout。用常驻守护进程持有日志 fd（参考 `runtime/qq_daemon.py`），或在 Docker 中运行 |
 | 快速登录不可用 | 需要先在宿主机用官方 QQ 登录一次生成记录，并把 `~/.config/QQ` 挂载/复制到运行环境 |
-| 重建容器后提示“登录态已失效” | QQ 的设备指纹包含 `/etc/machine-id`，换镜像/重建容器后该值会变，服务端会作废旧 token。把旧容器的 machine-id 持久化并挂载回去：`docker run ... -v /path/data/machine-id:/etc/machine-id:ro`（首次用 `docker exec <旧容器> cat /etc/machine-id` 取出）。本仓库 qq-proto 部署即采用此方式 |
-| poke 返回 `cmd whitelist patch not applied` | 当前 QQ 版本与插件内 RVA 不匹配（见 `docs/poke.md` 的跨版本说明） |
+| 重建容器后提示“登录态已失效” | QQ 的设备指纹包含 `/etc/machine-id`，换镜像/重建容器后该值会变，服务端会作废旧 token。把旧容器的 machine-id 持久化并挂载回去：`docker run ... -v /path/data/machine-id:/etc/machine-id:ro`（首次用 `docker exec <旧容器> cat /etc/machine-id` 取出）；Docker 部署建议把该文件放在持久卷中 |
+| poke 动作返回 `poke send failed`，日志有 `cmd whitelist patch not applied` | 当前 QQ 版本与插件内 RVA 不匹配（见 `docs/poke.md` 的跨版本说明） |
 | 自动下载 QQ 返回 403 | 安装器会自动调用官方 UrlSign 接口签名；若签名接口不可用会回退未签名地址并 403，此时可用 `KATHERYNE_QQ_DOWNLOAD_URL` 指向镜像，或手动下载后把解包目录传给安装器 |
 
 ## 目录结构
