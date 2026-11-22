@@ -121,13 +121,27 @@ class KatheryneRuntime {
             return;
         }
 
-        // 3. Auto quick-login if configured and a record exists.
+        // 3. Auto quick-login if configured and a record exists. The login
+        // service connection may still be coming up right after kernel init
+        // ("登录系统连接异常"), so retry a few times before giving up.
         const preferred = this.config.quick_login_uin;
         if (preferred) {
-            this.quickLogin(preferred).catch((e) => {
-                this.loginError = e instanceof Error ? e.message : String(e);
-                console.error('[katheryne] auto quick login failed:', this.loginError);
-            });
+            void (async () => {
+                for (let attempt = 1; attempt <= 6; attempt++) {
+                    try {
+                        await this.quickLogin(preferred);
+                        return;
+                    } catch (e) {
+                        this.loginError = e instanceof Error ? e.message : String(e);
+                        if (attempt === 6) {
+                            console.error('[katheryne] auto quick login failed:', this.loginError);
+                            return;
+                        }
+                        console.error(`[katheryne] auto quick login attempt ${attempt} failed, retrying in 2s:`, this.loginError);
+                        await new Promise((r) => setTimeout(r, 2000));
+                    }
+                }
+            })();
         }
     }
 
