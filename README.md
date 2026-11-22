@@ -95,7 +95,7 @@ KATHERYNE_CONFIG=./config.json /path/to/QQRoot/qq --no-sandbox --headless
   "ws":    { "enabled": true, "host": "0.0.0.0", "port": 6700, "access_token": "" },
   "reverseWs": { "enabled": false, "urls": ["ws://127.0.0.1:8080/"] },
   "console": { "enabled": true, "host": "0.0.0.0", "port": 6099 },
-  "blocked_private_uins": ["2909288299"]
+  "report_self_message": false
 }
 ```
 
@@ -183,7 +183,7 @@ docker run -d --name katheryne \
 | `set_friend_add_request` | 需真实待处理好友申请 |
 | `set_group_add_request` | 需真实待处理加群申请 |
 
-`blocked_private_uins`：私聊消息黑名单（默认 `["2909288299"]`，即腾讯新闻；置空数组可关闭）。命中的私聊消息不会产生任何 OneBot 事件。
+消息过滤（与 NapCat 对齐）：启动前的历史补发消息不上报；`KMSGTYPENULL` 空消息忽略；机器人自己发送的消息默认不上报，配置 `"report_self_message": true` 可开启（`sub_type: "self"`）。
 
 ### 事件
 
