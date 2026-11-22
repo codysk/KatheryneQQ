@@ -49,15 +49,15 @@ export interface KatheryneConfig extends NetworkConfig {
     packet_debug?: boolean;
 }
 
+function resolveConfigPath(): string {
+    return process.env.KATHERYNE_CONFIG
+        ?? path.join(os.homedir(), '.config', 'katheryneqq', 'config.json');
+}
+
 function loadConfig(): KatheryneConfig {
-    const candidates = [
-        process.env.KATHERYNE_CONFIG,
-        path.join(os.homedir(), '.config', 'katheryneqq', 'config.json'),
-    ].filter(Boolean) as string[];
-    for (const p of candidates) {
-        if (fs.existsSync(p)) {
-            return JSON.parse(fs.readFileSync(p, 'utf-8')) as KatheryneConfig;
-        }
+    const p = resolveConfigPath();
+    if (fs.existsSync(p)) {
+        return JSON.parse(fs.readFileSync(p, 'utf-8')) as KatheryneConfig;
     }
     return {
         http: { enabled: true, host: '0.0.0.0', port: 5700 },
@@ -84,6 +84,7 @@ class KatheryneRuntime {
     private readonly startedAt = Date.now();
     private readonly bootTimeSec = Math.floor(Date.now() / 1000);
     private config: KatheryneConfig = loadConfig();
+    private readonly configPath = resolveConfigPath();
     private consoleMgr: WebConsole | null = null;
     private network: NetworkManager | null = null;
     private uinToUid = new Map<string, string>();
@@ -1692,6 +1693,37 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             },
             logs() {
                 return self.consoleMgr?.recentLogs() ?? [];
+            },
+            async logins() {
+                if (!self.loginFlow) return [];
+                const list = await self.loginFlow.listLogins();
+                return list.map((item) => {
+                    const raw = item as unknown as Record<string, unknown>;
+                    return {
+                        uin: String(raw.uin ?? ''),
+                        uid: String(raw.uid ?? ''),
+                        nick: String(raw.nick ?? raw.nickName ?? ''),
+                        faceUrl: String(raw.faceUrl ?? ''),
+                    };
+                });
+            },
+            async getConfig() {
+                const p = self.configPath;
+                const content = fs.existsSync(p)
+                    ? fs.readFileSync(p, 'utf-8')
+                    : JSON.stringify(self.config, null, 2);
+                return { path: p, content };
+            },
+            async saveConfig(content: string) {
+                // Validate before writing so the next boot can't fail on syntax.
+                const parsed = JSON.parse(content) as unknown;
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    throw new Error('config must be a JSON object');
+                }
+                const p = self.configPath;
+                fs.mkdirSync(path.dirname(p), { recursive: true });
+                fs.writeFileSync(p, JSON.stringify(parsed, null, 2));
+                return { ok: true, path: p, restartRequired: true };
             },
         };
     }

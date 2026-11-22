@@ -40,139 +40,17 @@ export interface ConsoleBridge {
     logs(): string[];
     scanVtables?(): unknown;
     setPacketDebug?(on: boolean, count: number): unknown;
+    /** Local QQ login records for the quick-login page. */
+    logins?(): Promise<Array<{ uin: string; uid?: string; nick?: string; faceUrl?: string }>>;
+    /** Raw config file (used by the network/config page). */
+    getConfig?(): Promise<{ path: string; content: string }>;
+    saveConfig?(content: string): Promise<{ ok: boolean; path: string; restartRequired?: boolean }>;
 }
 
-const CONSOLE_HTML = String.raw`<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KatheryneQQ 控制台</title>
-<style>
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-body { margin: 0; font: 14px/1.6 system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1420; color: #dbe2f0; }
-header { display: flex; align-items: center; gap: 12px; padding: 14px 22px; background: #151c2c; border-bottom: 1px solid #232c42; }
-header h1 { font-size: 17px; margin: 0; }
-.badge { padding: 2px 10px; border-radius: 999px; font-size: 12px; background: #2b3550; }
-.badge.online { background: #1d5c3d; color: #7ef0b2; }
-.badge.offline { background: #5c2b2b; color: #f0a2a2; }
-main { display: grid; grid-template-columns: 340px 1fr; gap: 16px; padding: 16px 22px; max-width: 1400px; margin: 0 auto; }
-.card { background: #151c2c; border: 1px solid #232c42; border-radius: 10px; padding: 16px; }
-.card h2 { margin: 0 0 10px; font-size: 14px; color: #9fb0d0; font-weight: 600; }
-.kv { display: grid; grid-template-columns: 90px 1fr; gap: 4px 10px; font-size: 13px; }
-.kv .k { color: #7f8db0; }
-#qr { max-width: 240px; border-radius: 8px; background: #fff; padding: 8px; display: none; margin: 10px 0; }
-button { background: #2f6fed; border: 0; color: #fff; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
-button.gray { background: #3a4562; }
-button:disabled { opacity: .5; cursor: default; }
-.row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
-input, select { background: #0f1420; color: #dbe2f0; border: 1px solid #2b3550; border-radius: 8px; padding: 7px 10px; font-size: 13px; }
-#events { height: 420px; overflow-y: auto; font: 12px/1.5 ui-monospace, Consolas, monospace; }
-#events .ev { padding: 4px 8px; border-bottom: 1px solid #1b2338; white-space: pre-wrap; word-break: break-all; }
-#events .ev.message { color: #9ee493; }
-#events .ev.notice { color: #e4c07a; }
-#events .ev.request { color: #9db9f0; }
-#events .ev.meta_event { color: #5d6b8c; }
-#log { height: 180px; overflow-y: auto; font: 12px/1.5 ui-monospace, monospace; color: #8fa2c8; background: #0c111c; padding: 8px; border-radius: 8px; }
-.test-result { margin-top: 8px; font: 12px ui-monospace, monospace; color: #9ee493; white-space: pre-wrap; word-break: break-all; max-height: 220px; overflow: auto; }
-</style>
-</head>
-<body>
-<header>
-  <h1>KatheryneQQ</h1>
-  <span id="phase" class="badge">loading</span>
-  <span id="selfinfo" style="color:#7f8db0;font-size:13px"></span>
-</header>
-<main>
-  <div>
-    <div class="card">
-      <h2>登录</h2>
-      <div class="kv">
-        <span class="k">QQ 版本</span><span id="qqver">-</span>
-        <span class="k">AppID</span><span id="appid">-</span>
-        <span class="k">运行时长</span><span id="uptime">-</span>
-      </div>
-      <div class="row">
-        <button id="btn-qr">扫码登录</button>
-        <input id="uin" placeholder="QQ 号（快速登录）" style="width:180px">
-        <button id="btn-quick" class="gray">快速登录</button>
-        <button id="btn-cancel" class="gray">取消</button>
-      </div>
-      <img id="qr" alt="二维码">
-      <div id="login-hint" style="color:#e4c07a;font-size:12px"></div>
-    </div>
-    <div class="card" style="margin-top:14px">
-      <h2>动作调试</h2>
-      <div class="row">
-        <select id="action" style="min-width:200px"></select>
-        <input id="params" placeholder='{"group_id":"123","message":"hi"}' style="flex:1">
-        <button id="btn-run">执行</button>
-      </div>
-      <div id="result" class="test-result"></div>
-    </div>
-    <div class="card" style="margin-top:14px">
-      <h2>运行日志</h2>
-      <div id="log"></div>
-    </div>
-  </div>
-  <div class="card">
-    <h2>事件流（最近 500 条）</h2>
-    <div id="events"></div>
-  </div>
-</main>
-<script>
-const $ = (id) => document.getElementById(id);
-let lastEventCount = 0;
-
-function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
-
-async function refresh(){
-  try {
-    const st = await (await fetch('/api/state')).json();
-    $('phase').textContent = st.phase;
-    $('phase').className = 'badge ' + (st.phase === 'online' ? 'online' : 'offline');
-    $('selfinfo').textContent = st.selfUin ? (st.selfNick + ' (' + st.selfUin + ')') : '';
-    $('qqver').textContent = st.version;
-    $('appid').textContent = st.appid;
-    $('uptime').textContent = Math.floor((Date.now() - st.startedAt) / 1000) + 's';
-    if (st.qrcodeDataUrl) { $('qr').src = st.qrcodeDataUrl; $('qr').style.display = 'block'; }
-    else { $('qr').style.display = 'none'; }
-    $('login-hint').textContent = st.loginError || '';
-  } catch(e) {}
-  const evs = await (await fetch('/api/events')).json();
-  if (evs.length !== lastEventCount) {
-    lastEventCount = evs.length;
-    $('events').innerHTML = evs.map(e => '<div class="ev ' + esc(e.post_type) + '">' + esc(JSON.stringify(e)) + '</div>').join('');
-    $('events').scrollTop = $('events').scrollHeight;
-  }
-  const logs = await (await fetch('/api/logs')).json();
-  $('log').textContent = logs.join('\n');
-  $('log').scrollTop = $('log').scrollHeight;
-}
-
-$('btn-qr').onclick = async () => { await fetch('/api/login/qr', {method:'POST'}); refresh(); };
-$('btn-quick').onclick = async () => {
-  await fetch('/api/login/quick', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({uin: $('uin').value})});
-  refresh();
-};
-$('btn-cancel').onclick = async () => { await fetch('/api/login/cancel', {method:'POST'}); refresh(); };
-$('btn-run').onclick = async () => {
-  let params = {};
-  try { params = $('params').value ? JSON.parse($('params').value) : {}; } catch(e) { $('result').textContent = '参数 JSON 解析失败: ' + e.message; return; }
-  const r = await (await fetch('/api/action', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({action: $('action').value, params})})).json();
-  $('result').textContent = JSON.stringify(r, null, 2);
-};
-
-(async () => {
-  const names = await (await fetch('/api/actions')).json();
-  $('action').innerHTML = names.map(n => '<option>' + n + '</option>').join('');
-})();
-setInterval(refresh, 1500);
-refresh();
-</script>
-</body>
-</html>`;
+const CONSOLE_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>KatheryneQQ</title></head>
+<body style="font-family:system-ui;background:#0f1117;color:#e6ebf5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center"><h2>控制台资源缺失</h2><p style="color:#8b97ad">console.html 未随运行时部署，请重新执行安装器。</p></div>
+</body></html>`;
 
 export class WebConsole {
     private server: http.Server | null = null;
@@ -236,6 +114,28 @@ export class WebConsole {
                     case '/api/actions':
                         send(200, JSON.stringify(actionNames));
                         break;
+                    case '/api/logins': {
+                        const r = await Promise.resolve(this.bridge.logins?.() ?? []).catch(() => []);
+                        send(200, JSON.stringify(r));
+                        break;
+                    }
+                    case '/api/config': {
+                        if (req.method === 'POST') {
+                            const body = await readBody(req);
+                            const content = String(JSON.parse(body || '{}').content ?? '');
+                            try {
+                                const r = await this.bridge.saveConfig?.(content);
+                                send(200, JSON.stringify(r ?? { error: 'not available' }));
+                            } catch (e) {
+                                send(200, JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+                            }
+                        } else {
+                            const r = await Promise.resolve(this.bridge.getConfig?.() ?? { path: '', content: '' })
+                                .catch((e) => ({ path: '', content: JSON.stringify({ error: String(e) }, null, 2) }));
+                            send(200, JSON.stringify(r));
+                        }
+                        break;
+                    }
                     case '/api/login/qr':
                         await this.bridge.startQRLogin();
                         send(200, '{"ok":true}');

@@ -7,7 +7,7 @@
   "type": "module",
   "main": "dist/boot.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json && bash scripts/build-native.sh",
+    "build": "tsc -p tsconfig.json && cp src/console/console.html dist/console/console.html && bash scripts/build-native.sh",
     "install-katheryne": "node dist/installer/install.js",
     "build:native": "bash scripts/build-native.sh"
   },
