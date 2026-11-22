@@ -141,13 +141,19 @@ docker run -d --name katheryne \
 
 ## Web 控制台
 
-启动后打开 `http://127.0.0.1:6099/console`：
+启动后打开 `http://127.0.0.1:6099/console`（NapCat WebUI 风格多页布局，支持浅色/深色主题）：
 
-- 实时状态（运行阶段/QQ 版本/AppID）
-- 扫码登录（二维码直接在页面显示）/ 快速登录
-- 事件流（最近 500 条，分类着色）
-- 动作调试器（下拉选择动作 + JSON 参数执行）
-- 运行日志
+- **基础信息**：账号头像/昵称、在线状态、运行时长、QQ 版本/AppID、网络服务地址、最近事件
+- **QQ 登录**：快速登录（本地账号列表 + 头像）/ 扫码登录（二维码自动刷新）
+- **网络配置**：HTTP / WebSocket / 反向 WS / 控制台状态 + `config.json` 在线编辑（保存后重启生效）
+- **运行日志**：分级过滤、暂停、自动滚动
+- **接口调试**：动作下拉 + JSON 参数 + 结果展示 + 最近 10 条执行历史
+- **事件流**：类型过滤、全文搜索、暂停、展开原始 JSON
+- **关于**：版本信息与文档链接
+
+配置了 `username`/`password` 时启用 HTTP Basic 认证。控制台 API：`/api/state`、`/api/events`、
+`/api/logs`、`/api/actions`、`/api/action`、`/api/logins`、`/api/config`（GET/POST）、
+`/api/login/qr|quick|cancel`。
 
 ## OneBot v11 支持矩阵
 
