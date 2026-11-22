@@ -252,6 +252,7 @@ CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（�
 | 启动即崩溃（SIGTRAP/SIGSEGV），日志有 `Couldn't mmap icu data file` | QQ 根目录在 DrvFS/9p 等网络盘上（如 WSL 的 `/mnt/d`）。把 QQ 根目录放到本地 ext4（如 `/tmp` 或容器卷）再运行 |
 | 进程被 SIGPIPE 杀死（signal 13） | QQ 的 Bugly 崩溃处理会写已关闭的 stdout。用常驻守护进程持有日志 fd（参考 `runtime/qq_daemon.py`），或在 Docker 中运行 |
 | 快速登录不可用 | 需要先在宿主机用官方 QQ 登录一次生成记录，并把 `~/.config/QQ` 挂载/复制到运行环境 |
+| 重建容器后提示“登录态已失效” | QQ 的设备指纹包含 `/etc/machine-id`，换镜像/重建容器后该值会变，服务端会作废旧 token。把旧容器的 machine-id 持久化并挂载回去：`docker run ... -v /path/data/machine-id:/etc/machine-id:ro`（首次用 `docker exec <旧容器> cat /etc/machine-id` 取出）。本仓库 qq-proto 部署即采用此方式 |
 | poke 返回 `cmd whitelist patch not applied` | 当前 QQ 版本与插件内 RVA 不匹配（见 `docs/poke.md` 的跨版本说明） |
 | 自动下载 QQ 返回 403 | 安装器会自动调用官方 UrlSign 接口签名；若签名接口不可用会回退未签名地址并 403，此时可用 `KATHERYNE_QQ_DOWNLOAD_URL` 指向镜像，或手动下载后把解包目录传给安装器 |
 
