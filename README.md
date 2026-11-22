@@ -71,9 +71,11 @@ node dist/installer/install.js --download
 KATHERYNE_QQ_DOWNLOAD_URL=https://your-mirror/QQ.AppImage node dist/installer/install.js
 ```
 
-自动下载相关环境变量：`KATHERYNE_QQ_DOWNLOAD_URL`（直接覆盖安装包地址）、
+下载流程自动复刻官方页面：解析版本元数据 → 调用官方 **UrlSign 签名接口** 签名下载
+URL（未签名的 qqdl 请求会被 403）→ 下载 → 校验 → 解包。
+相关环境变量：`KATHERYNE_QQ_DOWNLOAD_URL`（直接覆盖安装包地址）、
 `KATHERYNE_QQ_DOWNLOAD_DIR`（缓存/解包目录）、`KATHERYNE_QQ_CONFIG_URL`
-（版本元数据地址，默认官方 `cdn-go.cn/.../rainbow/linuxConfig.js`）。
+（版本元数据地址）。签名链路细节见 [docs/download.md](docs/download.md)。
 安装完成后会打印 QQ 根目录与启动命令。
 
 ### 3. 登录
@@ -190,7 +192,7 @@ docker run -d --name katheryne \
 | 进程被 SIGPIPE 杀死（signal 13） | QQ 的 Bugly 崩溃处理会写已关闭的 stdout。用常驻守护进程持有日志 fd（参考 `runtime/qq_daemon.py`），或在 Docker 中运行 |
 | 快速登录不可用 | 需要先在宿主机用官方 QQ 登录一次生成记录，并把 `~/.config/QQ` 挂载/复制到运行环境 |
 | poke 返回 `cmd whitelist patch not applied` | 当前 QQ 版本与插件内 RVA 不匹配（见 `docs/poke.md` 的跨版本说明） |
-| 自动下载 QQ 返回 403 | 官方 CDN（qqdl.gtimg.cn）有区域限制，可用 `KATHERYNE_QQ_DOWNLOAD_URL` 指向可达镜像，或手动下载后把解包目录传给安装器 |
+| 自动下载 QQ 返回 403 | 安装器会自动调用官方 UrlSign 接口签名；若签名接口不可用会回退未签名地址并 403，此时可用 `KATHERYNE_QQ_DOWNLOAD_URL` 指向镜像，或手动下载后把解包目录传给安装器 |
 
 ## 目录结构
 
@@ -211,6 +213,7 @@ scripts/
   build-native.sh       # 原生插件构建
   docker-entrypoint.sh  # 容器入口
 docs/poke.md            # 主动 poke 逆向与实现记录
+docs/download.md        # 官方 QQ 下载签名链路分析
 .github/workflows/      # CI（构建+Docker）与 Release（产物+GHCR）
 ```
 

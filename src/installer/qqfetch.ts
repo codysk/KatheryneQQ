@@ -7,9 +7,10 @@
  *   (fallback: https://im.qq.com/rainbow/linuxConfig.js)
  * It yields { version, updateDate, x64DownloadUrl{deb,appimage,rpm}, ... }.
  *
- * We download the AppImage (portable, no root, works on any glibc distro),
- * verify it is an ELF, then extract it with its own `--appimage-extract`
- * (no FUSE required).
+ * We sign the package URL through the official UrlSign endpoint (qqdl
+ * rejects unsigned requests with 403), download the AppImage (portable, no
+ * root, any glibc distro), verify it is an ELF, then extract it with its own
+ * `--appimage-extract` (no FUSE required).
  *
  * Environment overrides (useful for mirrors/CI):
  *   KATHERYNE_QQ_CONFIG_URL      – metadata JSONP URL
@@ -37,8 +38,40 @@ const CONFIG_URLS = [
     'https://im.qq.com/rainbow/linuxConfig.js',
 ].filter(Boolean) as string[];
 
+/**
+ * Official download-link signing service, used by the im.qq.com download SPA
+ * before handing a URL to the browser. Unsigned qqdl.gtimg.cn requests are
+ * rejected (403); the response carries `?sign=<hex>&t=<ts>`.
+ */
+const SIGN_ENDPOINT = 'https://im.qq.com/http2rpc/gotrpc/noauth/trpc.qqntv2.urlsign.UrlSign/GetSign';
+const SIGN_OIDB = JSON.stringify({ uint32_command: '0x9b8e', uint32_service_type: 1 });
+
 function log(msg: string): void {
     console.log(`[qq-download] ${msg}`);
+}
+
+/** Sign a package URL via the official UrlSign endpoint (fallback: as-is). */
+export async function signQqUrl(url: string): Promise<string> {
+    try {
+        const res = await fetch(SIGN_ENDPOINT, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-oidb': SIGN_OIDB,
+                origin: 'https://im.qq.com',
+                referer: 'https://im.qq.com/index/',
+                'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) KatheryneQQ-installer',
+            },
+            body: JSON.stringify({ url }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = await res.json() as { retcode?: number; data?: { url?: string } };
+        if (body?.retcode === 0 && body?.data?.url) return body.data.url;
+        throw new Error(`retcode=${body?.retcode}`);
+    } catch (e) {
+        log(`signing failed (${e instanceof Error ? e.message : String(e)}), using unsigned URL`);
+        return url;
+    }
 }
 
 function dataRoot(): string {
@@ -111,14 +144,18 @@ export async function resolveQQRelease(): Promise<QQRelease> {
 async function download(url: string, dest: string): Promise<void> {
     const part = `${dest}.part`;
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    const res = await fetch(url, {
+    const signed = await signQqUrl(url);
+    if (signed !== url) log('URL signed');
+    const res = await fetch(signed, {
         headers: {
             'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) KatheryneQQ-installer',
-            referer: 'https://im.qq.com/',
+            // Real browsers download from the im.qq.com SPA; fragments are
+            // stripped by the client, so the wire value has no '#/linux'.
+            referer: 'https://im.qq.com/index/',
         },
         redirect: 'follow',
     });
-    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} for ${url}`);
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} for ${signed}`);
     const total = Number(res.headers.get('content-length') ?? 0);
     let written = 0, lastLog = 0;
     const out = fs.createWriteStream(part);
