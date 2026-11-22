@@ -42,6 +42,11 @@ export interface KatheryneConfig extends NetworkConfig {
     console?: ConsoleConfig;
     quick_login_uin?: string;
     data_path?: string;
+    /** Opt-in: install the MoeHoo SSO packet hook (debug/packet inspection).
+     * Poke send does NOT need it on 3.2.35; default off keeps the process free
+     * of .text trampolines and third-party modules. Also enabled by
+     * KATHERYNE_PACKET_DEBUG=1. */
+    packet_debug?: boolean;
 }
 
 function loadConfig(): KatheryneConfig {
@@ -273,12 +278,16 @@ class KatheryneRuntime {
             await ready;
             this.session = session;
             this.services = collectServices(session);
-            // Native SSO packet hook (MoeHoo). Poke send and other raw OIDB
-            // commands need the signed SSO envelope this hook can observe/reuse.
-            // Failures are non-fatal: everything else works without it.
-            void this.initPacketHook().then((ok) => {
-                this.consoleMgr?.log(`packet hook ${ok ? 'active' : 'unavailable (poke send degraded)'}`);
-            });
+            // MoeHoo SSO packet hook is OPT-IN (debug/packet inspection only):
+            // on 3.2.35 the legacy MSFSDK send path it taps is dead, and poke
+            // goes through sendMsfRequest without it. Skipping it by default
+            // keeps wrapper.node free of .text trampolines and avoids loading
+            // a third-party module into the QQ process.
+            if (this.packetDebugEnabled()) {
+                void this.initPacketHook().then((ok) => {
+                    this.consoleMgr?.log(`packet hook ${ok ? 'active' : 'unavailable'}`);
+                });
+            }
             this.attachMsgListener();
             this.attachGroupListener();
             this.attachBuddyListener();
@@ -874,9 +883,8 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
     }
 
     /**
-     * Install the MoeHoo SSO hook. Idempotent; resolves once the callback
-     * wiring is in place. Must run before login traffic starts ideally, but
-     * funchook interception works on an already-running connection too.
+     * Install the MoeHoo SSO packet hook (opt-in debug feature, see
+     * packetDebugEnabled). Idempotent; failure is non-fatal.
      */
     async initPacketHook(): Promise<boolean> {
         if (this.hooked) return true;
@@ -886,9 +894,11 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             const pathMod = await import('node:path');
             const path = pathMod.default ?? pathMod;
             const { fileURLToPath } = await import('node:url');
-            // MoeHoo lives in the repo work tree; resolve relative to this module.
             const here = path.dirname(fileURLToPath(import.meta.url));
             const candidates = [
+                // Bundled next to the runtime (deploy your own copy here).
+                path.resolve(here, '../native/MoeHoo.linux.x64.node'),
+                // Development tree (NapCat reference checkout).
                 path.resolve(here, '../../../..', 'work/ref/NapCatQQ/packages/napcat-native/packet/MoeHoo.linux.x64.node'),
                 '/mnt/d/project/KatheryneQQ/work/ref/NapCatQQ/packages/napcat-native/packet/MoeHoo.linux.x64.node',
             ];
@@ -935,9 +945,15 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
         }
     }
 
-    /** True once the SSO hook is live (poke send requires it). */
+    /** True once the SSO hook is live (optional packet inspection feature). */
     get packetHookReady(): boolean {
         return this.hooked;
+    }
+
+    /** MoeHoo packet hook is opt-in: config.packet_debug or env var. */
+    private packetDebugEnabled(): boolean {
+        if (process.env.KATHERYNE_PACKET_DEBUG === '1') return true;
+        return this.config.packet_debug === true;
     }
 
     /** Poke a user in a group or privately.

@@ -12,6 +12,7 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 - **主动戳一戳可用**：经 MSF 二进制通道发送 OIDB 0xED3_1（含原生插件放行内核 cmd 白名单），群聊/私聊均实测送达，原理见 [docs/poke.md](docs/poke.md)
 - **Web 控制台**：扫码登录、事件流、动作调试器、运行日志
 - **无 asar 解密、无二进制 patch**：只改明文 `resources/app/package.json` 的 `main` 字段
+- **默认进程足迹极小**：无代码 trampoline；仅 1 个 16KB 原生插件在首次 poke 时加载，改 16 字节 RELRO 表项并恢复页权限（详见 [docs/poke.md](docs/poke.md)）
 - **无 renderer 注入**：headless 直接驱动内核，QQ 渲染进程不启动
 - **消息段**：text / at / face / image / record / reply / json
 - **事件**：message / notice（撤回、戳一戳、群变动）/ request / meta_event

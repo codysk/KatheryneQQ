@@ -31,6 +31,8 @@
    - 表 1 形如 `{char* ptr, size_t len} × 25 @ RVA 0x8e81538`（跨版本可能变化，
      需按 `sendMsfRequest cmd:{} need add to cmd list` 字符串交叉引用重新定位）。
    - 原始项可通过 addon 的 `restore()` 恢复。
+   - 打完补丁后立即把页权限恢复为 `r--`（RELRO 原状），`/proc/self/maps`
+     不会出现异常的 `rw-p`。
 
 3. **OIDB 包格式**（与 NapCat packet 后端一致）：
    - `OidbSvcTrpcTcpBase`：`command(1)=0xED3`、`subCommand(2)=1`、
@@ -59,3 +61,16 @@
 - 构建：`npm run build`（内含 `scripts/build-native.sh`，需 gcc + Node 头文件；
   产物 `dist/native/katheryne_memsync.node`，安装器随 dist 一起部署）。
 - 运行时：登录后无需额外配置，第一次 poke 时自动 patch 白名单并发送。
+
+## 进程足迹（默认配置）
+
+| 项目 | 数量 | 说明 |
+|---|---|---|
+| 原生模块 | 1 | `katheryne_memsync.node`（16KB），首次 poke 时加载 |
+| 数据修改 | 16 字节 | RELRO 白名单表 1 项（指针 8B + 长度 8B），页权限已恢复 r-- |
+| 代码 trampoline | 0 | 见下 |
+
+MoeHoo packet hook（funchook 修改 wrapper.node `.text` 两个函数入口）已改为
+**可选调试功能**：默认不安装；需要抓包分析时用 `KATHERYNE_PACKET_DEBUG=1`
+环境变量或配置项 `"packet_debug": true` 开启（需要 MoeHoo 模块，放在
+`katheryne/native/` 下）。poke 不依赖它。

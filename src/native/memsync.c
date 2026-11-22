@@ -96,6 +96,10 @@ static napi_value Patch(napi_env env, napi_callback_info cbinfo)
     *slot = g_cmd_buf;
     *lslot = (uint64_t)strlen(g_cmd_buf);
 
+    /* Restore the original RELRO protection (r--) so the page does not stand
+     * out as rw-p in /proc/self/maps. */
+    mprotect((void *)page, (size_t)ps, PROT_READ);
+
     char msg[192];
     snprintf(msg, sizeof(msg), "patched: base=0x%lx slot=%p cmd=%s",
              (unsigned long)base, (void *)slot, g_cmd_buf);
@@ -108,8 +112,13 @@ static napi_value Restore(napi_env env, napi_callback_info cbinfo)
     (void)cbinfo;
     napi_value result;
     if (g_slot_ptr) {
-        *g_slot_ptr = g_orig_ptr;
-        *g_len_slot = g_orig_len;
+        long ps = sysconf(_SC_PAGESIZE);
+        uintptr_t page = ((uintptr_t)g_slot_ptr) & ~((uintptr_t)ps - 1);
+        if (mprotect((void *)page, (size_t)ps, PROT_READ | PROT_WRITE) == 0) {
+            *g_slot_ptr = g_orig_ptr;
+            *g_len_slot = g_orig_len;
+            mprotect((void *)page, (size_t)ps, PROT_READ);
+        }
         napi_create_string_utf8(env, "restored", NAPI_AUTO_LENGTH, &result);
     } else {
         napi_create_string_utf8(env, "nothing to restore", NAPI_AUTO_LENGTH, &result);
