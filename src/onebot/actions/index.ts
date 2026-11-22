@@ -246,13 +246,13 @@ const actions: Record<string, ActionHandler> = {
         const peerUinNum = Number(str(p, 'group_id'));
         if (!Number.isFinite(peerUinNum)) throw new ActionError(1400, 'invalid group id');
         const ok = await ctx.sendPoke(str(p, 'user_id'), String(peerUinNum), true);
-        if (!ok) throw new ActionError(1500, 'poke send failed: OIDB packet rejected by kernel (requires native packet hook)');
+        if (!ok) throw new ActionError(1500, 'poke send unavailable on this QQ build (3.2.35 removed the raw-SSO send path; see docs/poke.md)');
         return {};
     },
     friend_poke: async (p, ctx) => {
         const target = str(p, 'user_id');
         const ok = await ctx.sendPoke(target, target, false);
-        if (!ok) throw new ActionError(1500, 'poke send failed');
+        if (!ok) throw new ActionError(1500, 'poke send unavailable on this QQ build (3.2.35 removed the raw-SSO send path; see docs/poke.md)');
         return {};
     },
     get_cookies: async (p, ctx) => ({ cookies: await ctx.getCookies(str(p, 'domain')) }),

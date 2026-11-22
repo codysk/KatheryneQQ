@@ -273,6 +273,12 @@ class KatheryneRuntime {
             await ready;
             this.session = session;
             this.services = collectServices(session);
+            // Native SSO packet hook (MoeHoo). Poke send and other raw OIDB
+            // commands need the signed SSO envelope this hook can observe/reuse.
+            // Failures are non-fatal: everything else works without it.
+            void this.initPacketHook().then((ok) => {
+                this.consoleMgr?.log(`packet hook ${ok ? 'active' : 'unavailable (poke send degraded)'}`);
+            });
             this.attachMsgListener();
             this.attachGroupListener();
             this.attachBuddyListener();
@@ -536,6 +542,18 @@ class KatheryneRuntime {
             const els = (m.elements ?? []) as Array<Record<string, any>>;
             for (const el of els) {
                 const gray = el.grayTipElement;
+                // Debug: dump gray-tip payload shapes to learn the real poke representation.
+                if (this.pokeShapeDebug && gray) {
+                    const json = gray.jsonGrayTipElement?.jsonStr;
+                    const summary = typeof json === 'string' ? json.slice(0, 300) : undefined;
+                    console.error('[graytip-shape]', JSON.stringify({
+                        chatType: m.chatType,
+                        subType: gray.subElementType,
+                        hasFace: !!el.faceElement,
+                        faceElement: el.faceElement ?? undefined,
+                        json: summary,
+                    }).slice(0, 700));
+                }
                 if (!gray) continue;
                 const isGroup = Number(m.chatType ?? 0) === 2;
                 const base = {
@@ -588,6 +606,162 @@ class KatheryneRuntime {
 
 
     // ---------------- OIDB packet send (poke etc.) ----------------
+
+    /**
+     * Scan this process's memory for the KernelMsgService vtable.
+     * We're inside the QQ process so /proc/self/mem is readable.
+     */
+    /**
+     * Find the KernelMsgService vtable entry 241 (sendSsoCmdReqByContend impl)
+     * by using MoeHoo's hook mechanism + writev interception.
+     * Alternative: use V8's external memory to get the service object pointer.
+     */
+    private findMsgServiceVtable(): unknown {
+        try {
+            // The NAPI wrapper for msgService holds a native pointer to the C++ object.
+            // We can't get it from JS directly, but we can use a trick:
+            // The kernel's sendSsoCmdReqByContend NAPI binding reads vtable+0x788.
+            // We hook sendSsoCmdReqByContend at the NAPI level and inspect internals.
+            // 
+            // Simplest reliable approach: MoeHoo already hooks write/writev.
+            // When ANY SSO packet is written to socket, we can inspect the call stack
+            // to find the caller in wrapper.node text segment.
+            // But this requires backtrace support.
+            //
+            // Most direct: we already know the NAPI binding for sendSsoCmdReqByContend
+            // is at static offset 0x39e4440 (from our capstone analysis).
+            // The binding calls [vtable+0x788]. We can read the vtable from the 
+            // service object if we know its address.
+            //
+            // Trick: NAPI objects have internal fields. The service JS object wraps
+            // a C++ pointer. We can extract it using napi_external or by reading
+            // the object's aligned pointer via a native addon.
+            // 
+            // For now, return what we can: scan for vtable-like patterns near the
+            // known entry offsets found in rwPtrs dump
+            return { hint: 'Use wrapperRwPtrs dump + NAPI binding cross-reference' };
+        } catch (e) { return { error: String(e) }; }
+    }
+
+    private async scanVtablesInProcess(): Promise<unknown> {
+        try {
+            const fsMod = await import('node:fs');
+            const fs = fsMod.default ?? fsMod;
+            const maps = fs.readFileSync('/proc/self/maps', 'utf8');
+            let textStart = 0, textEnd = 0, base = 0;
+            for (const l of maps.split('\n')) {
+                if (l.includes('wrapper.node')) {
+                    const [range] = l.split(' ');
+                    const [s2, e2] = range.split('-');
+                    if (!base) base = parseInt(s2, 16);
+                    if (l.includes('r-xp')) { textStart = parseInt(s2, 16); textEnd = parseInt(e2, 16); }
+                }
+            }
+            if (!textStart) return { error: 'wrapper.node text not found' };
+            const fd = fs.openSync('/proc/self/mem', 'r');
+            const results: unknown[] = [];
+            const CHUNK = 0x100000; // 1MB chunks
+            const buf = Buffer.alloc(CHUNK);
+            for (const l of maps.split('\n')) {
+                const parts = l.split(' ');
+                if (parts.length < 2 || !(parts[1].startsWith('rw') || (parts[1].startsWith('r--') && l.includes('wrapper.node')))) continue;
+                const [rs, re] = parts[0].split('-');
+                const start = parseInt(rs, 16), end = parseInt(re, 16);
+                const size = end - start;
+                if (size < 0x1000 || size > 0x1000000) continue; // 4KB-16MB
+                let run = 0, runStart = 0;
+                for (let off = 0; off < size; off += CHUNK) {
+                    const toRead = Math.min(CHUNK, size - off);
+                    const n = fs.readSync(fd, buf, 0, toRead, start + off);
+                    if (n < toRead) break;
+                    for (let j = 0; j < n; j += 8) {
+                        const v = buf.readBigUInt64LE(j);
+                        if (v >= BigInt(textStart) && v < BigInt(textEnd)) {
+                            if (run === 0) runStart = start + off + j;
+                            run++;
+                            (globalThis as any).__ktp = ((globalThis as any).__ktp ?? 0) + 1;
+                        } else {
+                            if (run >= 40) {
+                                // Check entry 241 from runStart (allow gaps)
+                                const e241Addr = runStart + 241 * 8;
+                                try {
+                                    const n2 = fs.readSync(fd, buf, 0, 8, e241Addr);
+                                    if (n2 === 8) {
+                                        const e241 = buf.readBigUInt64LE(0);
+                                        if (e241 >= BigInt(textStart) && e241 < BigInt(textEnd)) {
+                                            results.push({
+                                                vtable: '0x' + runStart.toString(16),
+                                                runLen: run,
+                                                entry241: '0x' + e241.toString(16),
+                                                rva241: '0x' + (e241 - BigInt(base)).toString(16),
+                                            });
+                                        }
+                                    }
+                                } catch { /* unreadable */ }
+                            }
+                            run = 0;
+                        }
+                    }
+                }
+                if (run >= 80) results.push({ vtable: '0x' + runStart.toString(16), entries: run, partial: true });
+            }
+            const wrapperRw = maps.split('\n').filter((l: string) => l.includes('wrapper.node') && (l.includes('rw') || l.includes('r--'))).filter((l: string) => !l.includes('r-x')).map((l: string) => {
+                const [r] = l.split(' ');
+                const [a, b] = r.split('-');
+                return { start: parseInt(a, 16), end: parseInt(b, 16) };
+            });
+            const ptrLocs: string[] = [];
+            for (const w of wrapperRw) {
+                for (let a = w.start; a < w.end - 8; a += 8) {
+                    const n2 = fs.readSync(fd, buf, 0, 8, a);
+                    if (n2 === 8) {
+                        const v = buf.readBigUInt64LE(0);
+                        if (v >= BigInt(textStart) && v < BigInt(textEnd)) {
+                            ptrLocs.push('0x' + (a - base).toString(16) + '->0x' + (v - BigInt(base)).toString(16));
+                        }
+                    }
+                }
+            }
+            // Analyze RELRO runs for vtable with entry 241
+            const allPairs: Array<[number, bigint]> = [];
+            for (const w of wrapperRw) {
+                for (let a = w.start; a < w.end - 8; a += 8) {
+                    const n2 = fs.readSync(fd, buf, 0, 8, a);
+                    if (n2 === 8) {
+                        const v = buf.readBigUInt64LE(0);
+                        if (v >= BigInt(textStart) && v < BigInt(textEnd)) {
+                            allPairs.push([a, v]);
+                        }
+                    }
+                }
+            }
+            allPairs.sort((a, b) => a[0] - b[0]);
+            const vtResults: unknown[] = [];
+            let runStart2 = -1, runCount = 0, lastLoc = -1;
+            for (const [loc, v] of allPairs) {
+                if (runStart2 < 0 || loc - lastLoc > 32) {
+                    if (runCount >= 200 && runStart2 >= 0) {
+                        const idx = runStart2 + 241 * 8;
+                        const hit = allPairs.find((p2) => p2[0] === idx);
+                        if (hit) {
+                            vtResults.push({ at: '0x' + runStart2.toString(16), entries: runCount, entry241Rva: '0x' + hit[1].toString(16) });
+                        }
+                    }
+                    runStart2 = loc; runCount = 1;
+                } else { runCount++; }
+                lastLoc = loc;
+            }
+            if (runCount >= 200 && runStart2 >= 0) {
+                const idx = runStart2 + 241 * 8;
+                const hit = allPairs.find((p2) => p2[0] === idx);
+                if (hit) vtResults.push({ at: '0x' + runStart2.toString(16), entries: runCount, entry241Rva: '0x' + hit[1].toString(16) });
+            }
+            fs.closeSync(fd);
+            return { base: '0' + 'x' + base.toString(16), totalRelroPtrs: allPairs.length, bigVtables: vtResults.slice(0, 10) };
+        } catch (e) {
+            return { error: String(e) };
+        }
+    }
 
     /**
      * Minimal protobuf writer (varint tags, length-delimited fields) — enough
@@ -660,21 +834,185 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
         }
     }
 
-    /** Poke a user in a group or privately (OIDB 0xED3_1). */
-    private async sendPoke(targetUin: number, peerUin: number, isGroup: boolean): Promise<boolean> {
-        const body = this.buildPokeBody(targetUin, peerUin, isGroup);
-        // Fire-and-forget like NapCat's sendOidbPacket(rsp=false): the
-        // kernel's async response (even error codes) doesn't indicate
-        // whether the poke reached the recipient.
+    // ---------------- native packet hook (MoeHoo) ----------------
+    //
+    // MoeHoo.linux.x64.node (NapCat's packet module) hooks the SSO send/recv
+    // functions inside wrapper.node via funchook, exposing every SSO packet
+    // as (type, uin, cmd, seq, hex_data) callbacks. InitHook takes hex strings
+    // whose parsed values it shifts RIGHT by 1 — so we must pass realRva << 1.
+    //
+    // For QQ 3.2.35-54395 the SSO send function was located by signature: the
+    // 3.2.34-53644 anchor (real RVA 0x65f92d0) matches byte-for-byte and
+    // uniquely in our wrapper.node (verified against the pristine AppImage).
+    // Function entry is 0x65f9110; the mid-function address NapCat-style
+    // tables carry (0x65f92d0) hooks equally well — we pass the entry.
+    private static readonly SSO_SEND_RVA = 0x670dd20; // MSF::MSFSDK::sendPacket(unique_ptr<MSFRequest>) — dynsym
+    private static readonly SSO_RECV_RVA = 0x65fa070; // 3.2.34 recv anchor (>>1 decoded)
+    private static readonly MOEHOOK_PATH = '../../work/ref/NapCatQQ/packages/napcat-native/packet/MoeHoo.linux.x64.node';
+
+    private moehooMod: { exports: Record<string, (...a: unknown[]) => unknown> } | null = null;
+    /** Packet listeners by SSO command name ('' = all). */
+    private packetListeners = new Map<string, Set<(pkt: { type: number; uin: string; cmd: string; seq: number; hex: string }) => void>>();
+    private hooked = false;
+    /** Set by console API: log the next N packets at full detail. */
+    packetDebug = false;
+    packetDebugCount = 0;
+    /** Log incoming face-bearing gray tips (poke shape research). */
+    pokeShapeDebug = true;
+
+    /** Encode a real RVA the way MoeHoo's InitHook expects (left-shifted by 1). */
+    private encodeRva(rva: number): string {
+        return (rva << 1).toString(16);
+    }
+
+    /** Subscribe to SSO packets; returns an unsubscribe function. */
+    onPacket(cmd: string, fn: (pkt: { type: number; uin: string; cmd: string; seq: number; hex: string }) => void): () => void {
+        const key = cmd ?? '';
+        if (!this.packetListeners.has(key)) this.packetListeners.set(key, new Set());
+        this.packetListeners.get(key)!.add(fn);
+        return () => { this.packetListeners.get(key)?.delete(fn); };
+    }
+
+    /**
+     * Install the MoeHoo SSO hook. Idempotent; resolves once the callback
+     * wiring is in place. Must run before login traffic starts ideally, but
+     * funchook interception works on an already-running connection too.
+     */
+    async initPacketHook(): Promise<boolean> {
+        if (this.hooked) return true;
+        try {
+            const fsMod = await import('node:fs');
+            const fs = fsMod.default ?? fsMod;
+            const pathMod = await import('node:path');
+            const path = pathMod.default ?? pathMod;
+            const { fileURLToPath } = await import('node:url');
+            // MoeHoo lives in the repo work tree; resolve relative to this module.
+            const here = path.dirname(fileURLToPath(import.meta.url));
+            const candidates = [
+                path.resolve(here, '../../../..', 'work/ref/NapCatQQ/packages/napcat-native/packet/MoeHoo.linux.x64.node'),
+                '/mnt/d/project/KatheryneQQ/work/ref/NapCatQQ/packages/napcat-native/packet/MoeHoo.linux.x64.node',
+            ];
+            const modPath = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+            if (!modPath) {
+                console.error('[katheryne] MoeHoo module not found');
+                return false;
+            }
+            const mod = { exports: {} as Record<string, (...a: unknown[]) => unknown> };
+            (process as unknown as { dlopen: (m: unknown, p: string) => void }).dlopen(mod, modPath);
+            if (typeof mod.exports.initHook !== 'function') {
+                console.error('[katheryne] MoeHoo initHook export missing');
+                return false;
+            }
+            this.moehooMod = mod;
+            const dispatch = (type: number, uin: string, cmd: string, seq: number, hex: string) => {
+                if (this.packetDebug) {
+                    // First N packets logged at full length for envelope analysis.
+                    if (this.packetDebugCount > 0) {
+                        this.packetDebugCount--;
+                        console.error(`[moehoo-cb] type=${type} uin=${uin} cmd=${cmd} seq=${seq} len=${hex.length / 2} hex=${hex.slice(0, 400)}`);
+                    }
+                }
+                for (const fn of this.packetListeners.get('') ?? []) {
+                    try { fn({ type, uin, cmd, seq, hex }); } catch { /* listener error */ }
+                }
+                for (const fn of this.packetListeners.get(cmd) ?? []) {
+                    try { fn({ type, uin, cmd, seq, hex }); } catch { /* listener error */ }
+                }
+            };
+            const result = mod.exports.initHook(
+                this.encodeRva(KatheryneRuntime.SSO_SEND_RVA),
+                this.encodeRva(KatheryneRuntime.SSO_RECV_RVA),
+                dispatch,
+                false,
+            ) as string;
+            const ok = result === 'success' || String(result).includes('success');
+            this.hooked = ok;
+            console.error(`[katheryne] moehoo initHook -> ${result}`);
+            return ok;
+        } catch (e) {
+            console.error('[katheryne] moehoo load error', e instanceof Error ? e.message : e);
+            return false;
+        }
+    }
+
+    /** True once the SSO hook is live (poke send requires it). */
+    get packetHookReady(): boolean {
+        return this.hooked;
+    }
+
+    /** Poke a user in a group or privately.
+     *
+     * NOT AVAILABLE on QQ 3.2.35: the raw-SSO send path this needs was
+     * removed (see docs/poke.md). We keep the API surface but always report
+     * failure so callers don't mistake a degraded plain-face message for a
+     * delivered poke. See docs/poke.md for the full investigation.
+     */
+    private async sendPoke(_targetUin: number, _peerUin: number, _isGroup: boolean): Promise<boolean> {
+        return false;
+    }
+
+    /** Historical experiment kept for reference: NT face-element poke attempt.
+     *
+     * The kernel accepts this shape (result:0) but degrades it to a plain
+     * face message — incoming pokes are server-rendered gray tips that
+     * cannot be reconstructed from client elements.
+     */
+    private async sendPokeFaceExperiment(targetUin: number, peerUin: number, isGroup: boolean): Promise<boolean> {
         try {
             const msgService = this.services?.msg as any;
-            if (!msgService?.sendSsoCmdReqByContend) return false;
-            const packet = this.buildOidb(0xED3, 1, body);
-            const full = 'OidbSvcTrpcTcp.0xED3_1';
-            void Promise.resolve(msgService.sendSsoCmdReqByContend(full, packet))
-                .catch(() => undefined);
-            return true;
-        } catch {
+            if (!msgService?.sendMsg) return false;
+            let targetUid = this.uinToUid.get(String(targetUin)) ?? '';
+            if (!targetUid) {
+                // Cold cache: ask the profile service (uid is keyed by uin there).
+                try {
+                    const profile = this.services?.profile as any;
+                    // getCoreAndBaseInfo requires uids; instead query via group member list of the peer group.
+                    if (isGroup) {
+                        const group = this.services?.group as any;
+                        const members = await group?.getAllMemberList?.(String(peerUin), true);
+                        const infos = (members?.result?.infos ?? members?.infos ?? {}) as unknown;
+                        const mm = infos as Map<string, Record<string, any>>;
+                        for (const [uid, info] of (typeof mm.entries === 'function' ? [...mm.entries()] : Object.entries(infos as Record<string, Record<string, any>>))) {
+                            const uin = String(info?.uin ?? info?.coreInfo?.uin ?? '');
+                            if (uin) { this.uidToUin.set(uid, uin); this.uinToUid.set(uin, uid); }
+                        }
+                        targetUid = this.uinToUid.get(String(targetUin)) ?? '';
+                    }
+                } catch { /* resolution failed */ }
+            }
+            if (!targetUid) {
+                console.error('[poke-debug] no uid for target', targetUin);
+                return false;
+            }
+            const peer = isGroup
+                ? { chatType: 2, peerUid: String(peerUin), guildId: '' }
+                : { chatType: 1, peerUid: targetUid, guildId: '' };
+            const elements: Array<Record<string, unknown>> = [
+                {
+                    elementType: 1, // TEXT carrying the @-mention of the poke target
+                    elementId: '',
+                    textElement: { content: '', atType: 1, atUid: targetUid, atNtUid: targetUid, atTinyId: '' },
+                },
+                {
+                    elementType: 6, // FACE carrying the poke action
+                    elementId: '',
+                    faceElement: {
+                        faceIndex: 0,
+                        faceType: 5, // FaceType.Poke
+                        pokeType: 1, // POKE_TYPE_POKE
+                        faceText: '',
+                    },
+                },
+            ];
+            const ret = await Promise.race([
+                Promise.resolve(msgService.sendMsg('0', peer, elements, new Map())),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+            ]) as Record<string, unknown> | undefined;
+            console.error('[poke-debug] sendMsg response:', JSON.stringify(ret)?.slice(0, 300));
+            const result = Number((ret as { result?: number })?.result ?? 0);
+            return result === 0;
+        } catch (e) {
+            console.error('[poke-debug] error', e instanceof Error ? e.message : e);
             return false;
         }
     }
@@ -1189,6 +1527,14 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             },
             actionContext() {
                 return self.phase === 'online' ? self.buildActionContext() : null;
+            },
+            scanVtables() {
+                return self.scanVtablesInProcess();
+            },
+            setPacketDebug(on: boolean, count: number) {
+                self.packetDebug = on;
+                self.packetDebugCount = on ? Math.max(1, Math.min(count || 20, 100)) : 0;
+                return { on: self.packetDebug, count: self.packetDebugCount };
             },
             logs() {
                 return self.consoleMgr?.recentLogs() ?? [];

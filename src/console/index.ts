@@ -38,6 +38,8 @@ export interface ConsoleBridge {
     cancelLogin(): Promise<void>;
     actionContext(): ActionContext | null;
     logs(): string[];
+    scanVtables?(): unknown;
+    setPacketDebug?(on: boolean, count: number): unknown;
 }
 
 const CONSOLE_HTML = String.raw`<!DOCTYPE html>
@@ -249,6 +251,47 @@ export class WebConsole {
                         await this.bridge.cancelLogin();
                         send(200, '{"ok":true}');
                         break;
+                    case '/api/scan-vtables': {
+                        const r = await Promise.resolve(this.bridge.scanVtables?.()).catch((e) => ({ error: String(e) }));
+                        send(200, JSON.stringify(r ?? { error: "not available" }));
+                        break;
+                    }
+                    case '/api/packet-debug': {
+                        const body = await readBody(req);
+                        const { on, count } = JSON.parse(body || '{}') as { on?: boolean; count?: number };
+                        const r = await Promise.resolve(this.bridge.setPacketDebug?.(!!on, Number(count) || 20)).catch((e) => ({ error: String(e) }));
+                        send(200, JSON.stringify(r ?? { error: "not available" }));
+                        break;
+                    }
+                    case '/api/mem-read': {
+                        // Debug helper: read N bytes at (wrapper load bias + rva) from /proc/self/mem.
+                        const rva = parseInt(url.searchParams.get('rva') ?? '0', 16);
+                        const len = Math.min(parseInt(url.searchParams.get('len') ?? '32', 10) || 32, 4096);
+                        try {
+                            const fsMod = await import('node:fs');
+                            const fs = fsMod.default ?? fsMod;
+                            const maps = fs.readFileSync('/proc/self/maps', 'utf8');
+                            let bias = null as bigint | null;
+                            for (const l of maps.split('\n')) {
+                                if (l.includes('wrapper.node') && l.includes('r-x')) {
+                                    const s = BigInt('0x' + l.split('-')[0]);
+                                    const off = BigInt('0x' + (l.split(/\s+/)[2] ?? '0'));
+                                    bias = s - off - 0x1000n;
+                                    break;
+                                }
+                            }
+                            if (bias === null) throw new Error('wrapper r-x not mapped');
+                            const addr = bias + BigInt(rva);
+                            const fd = fs.openSync('/proc/self/mem', 'r');
+                            const buf = Buffer.alloc(len);
+                            const n = fs.readSync(fd, buf, 0, len, Number(addr));
+                            fs.closeSync(fd);
+                            send(200, JSON.stringify({ bias: '0x' + bias.toString(16), addr: '0x' + addr.toString(16), n, hex: buf.subarray(0, n).toString('hex') }));
+                        } catch (e) {
+                            send(200, JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+                        }
+                        break;
+                    }
                     case '/api/action': {
                         const body = await readBody(req);
                         const { action, params } = JSON.parse(body || '{}') as { action: string; params: ActionParams };

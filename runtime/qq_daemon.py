@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Persistent daemon: holds QQ's log fd so Bugly never SIGPIPEs; auto-restarts."""
 import subprocess, time, os, sys
-QQ_ROOT = '/mnt/d/project/KatheryneQQ/work/qq/squashfs-root'
+QQ_ROOT = '/tmp/kqq/squashfs-root'
 LOG = '/mnt/d/project/KatheryneQQ/runtime/qq.log'
 while True:
     logf = open(LOG, 'ab')
