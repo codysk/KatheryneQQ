@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build (tsc + native addon)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Verify build artifacts
+        run: |
+          set -e
+          test -f dist/boot.js
+          test -f dist/core/runtime.js
+          test -f dist/onebot/actions/index.js
+          test -f dist/installer/install.js
+          test -f dist/native/katheryne_memsync.node
+          echo "artifacts OK"
+
+  docker:
+    name: Docker image (build only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: katheryneqq:ci

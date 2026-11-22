@@ -1,0 +1,13 @@
+.git
+.gitignore
+.github
+node_modules
+dist
+native
+work
+tools
+runtime
+docs
+*.log
+qr_current.png
+config.json

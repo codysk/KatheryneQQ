@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # GitHub Release
+  packages: write   # GHCR image
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/katheryneqq
+
+jobs:
+  release:
+    name: GitHub Release (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Package runtime bundle
+        run: |
+          set -e
+          mkdir -p out
+          tar -czf "out/katheryne-${GITHUB_REF_NAME}.tar.gz" -C dist .
+          ls -la out/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  docker:
+    name: Publish image (GHCR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
