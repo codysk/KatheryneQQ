@@ -1164,6 +1164,19 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
 
     private buildActionContext(): ActionContext {
         const self = this;
+        /** Log a kernel group-op response and throw when it reports failure. */
+        const kernelOp = (op: string, r: unknown): void => {
+            const rr = (r ?? {}) as Record<string, any>;
+            const nested = rr.result && typeof rr.result === 'object' ? rr.result : null;
+            const code = typeof rr.result === 'number' ? rr.result
+                : typeof nested?.result === 'number' ? nested.result
+                : undefined;
+            const msg = String(rr.errMsg ?? nested?.errMsg ?? '');
+            console.error(`[group-op] ${op}:`, JSON.stringify(r)?.slice(0, 300));
+            if (code !== undefined && code !== 0) {
+                throw new Error(`${op} rejected: code=${code} ${msg}`.trim());
+            }
+        };
         return {
             get selfUin() {
                 return self.selfUin;
@@ -1491,36 +1504,36 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             },
             async setGroupBan(groupCode, memberUid, durationSec) {
                 const group = self.requireServices().group;
-                await group.setMemberShutUp(groupCode, [{ uid: memberUid, timeStamp: Math.max(0, durationSec) }]);
+                kernelOp('setMemberShutUp', await group.setMemberShutUp(groupCode, [{ uid: memberUid, timeStamp: Math.max(0, durationSec) }]));
             },
             async setGroupWholeBan(groupCode, enable) {
                 const group = self.requireServices().group;
-                await group.setGroupShutUp(groupCode, enable);
+                kernelOp('setGroupShutUp', await group.setGroupShutUp(groupCode, enable));
             },
             async setGroupKick(groupCode, memberUids, rejectForever) {
                 const group = self.requireServices().group;
-                await group.kickMember(groupCode, memberUids, rejectForever, '');
+                kernelOp('kickMember', await group.kickMember(groupCode, memberUids, rejectForever, ''));
             },
             async setGroupLeave(groupCode, dismiss) {
                 const group = self.requireServices().group;
-                if (dismiss) await group.destroyGroup(groupCode);
-                else await group.quitGroup(groupCode);
+                if (dismiss) kernelOp('destroyGroup', await group.destroyGroup(groupCode));
+                else kernelOp('quitGroup', await group.quitGroup(groupCode));
             },
             async setGroupCard(groupCode, memberUid, card) {
                 const group = self.requireServices().group;
-                await group.modifyMemberCardName(groupCode, memberUid, card);
+                kernelOp('modifyMemberCardName', await group.modifyMemberCardName(groupCode, memberUid, card));
             },
             async setGroupName(groupCode, name) {
                 const group = self.requireServices().group;
-                await group.modifyGroupName(groupCode, name, false);
+                kernelOp('modifyGroupName', await group.modifyGroupName(groupCode, name, false));
             },
             async setGroupAdmin(groupCode, memberUid, enable) {
                 const group = self.requireServices().group;
-                await group.modifyMemberRole(groupCode, memberUid, enable ? 2 : 3);
+                kernelOp('modifyMemberRole', await group.modifyMemberRole(groupCode, memberUid, enable ? 2 : 3));
             },
             async setGroupAvatar(groupCode, file) {
                 const group = self.requireServices().group;
-                await group.setHeader(groupCode, file);
+                kernelOp('setHeader', await group.setHeader(groupCode, file));
             },
             async handleFriendRequest(flag, accept) {
                 const buddy = self.requireServices().buddy;
