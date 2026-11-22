@@ -6,3 +6,4 @@ work/
 config.json
 qr_current.png
 tools/
+runtime/daemon.out
