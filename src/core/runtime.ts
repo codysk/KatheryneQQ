@@ -84,6 +84,18 @@ function sniffImageExt(buf: Buffer): string | undefined {
     return undefined;
 }
 
+/** Detect common audio formats from magic bytes. */
+function sniffAudioExt(buf: Buffer): string | undefined {
+    if (buf.length >= 9 && buf.subarray(0, 9).toString('latin1').includes('#!SILK')) return 'silk';
+    if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WAVE') return 'wav';
+    if (buf.length >= 4 && buf.subarray(0, 4).toString('ascii') === 'fLaC') return 'flac';
+    if (buf.length >= 4 && buf.subarray(0, 4).toString('ascii') === 'OggS') return 'ogg';
+    if (buf.length >= 6 && buf.subarray(0, 6).toString('ascii') === '#!AMR\n') return 'amr';
+    if (buf.length >= 3 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return 'mp3';
+    if (buf.length >= 2 && buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return 'mp3';
+    return undefined;
+}
+
 class KatheryneRuntime {
     private kernel: LoadedKernel | null = null;
     private loginFlow: LoginFlow | null = null;
@@ -1559,7 +1571,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
      * Accepts absolute paths, file://, data: URIs (base64 or percent-encoded),
      * base64://, bare base64 image bodies, and http(s) URLs (downloaded).
      */
-    private async materializeImageSource(src: string): Promise<string> {
+    private async materializeMediaSource(src: string, kind: 'image' | 'record' = 'image'): Promise<string> {
         const raw = String(src ?? '').trim();
         if (!raw) throw new Error('empty image source');
         if (raw.startsWith('/')) {
@@ -1576,16 +1588,19 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
         if (!/^(data:|base64:|https?:)/i.test(raw)) {
             const meta = this.mediaIndex.get(raw);
             if (meta?.localPath && fs.existsSync(meta.localPath)) return meta.localPath;
-            if (meta?.url) return await this.materializeImageSource(meta.url);
+            if (meta?.url) return await this.materializeMediaSource(meta.url, kind);
         }
         const dir = this.downloadTempPath && fs.existsSync(this.downloadTempPath)
             ? this.downloadTempPath
             : os.tmpdir();
         fs.mkdirSync(dir, { recursive: true });
+        const sniff = kind === 'record' ? sniffAudioExt : sniffImageExt;
+        const defaultExt = kind === 'record' ? 'silk' : 'png';
         const writeTemp = (buf: Buffer, extHint?: string): string => {
-            if (!buf.length) throw new Error('empty image data');
-            const ext = String(extHint || sniffImageExt(buf) || 'png').replace(/^\./, '').replace(/[^a-z0-9]/gi, '') || 'png';
-            const file = path.join(dir, `katheryne-img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
+            if (!buf.length) throw new Error('empty media data');
+            const ext = String(extHint || sniff(buf) || defaultExt).replace(/^\./, '').replace(/[^a-z0-9]/gi, '') || defaultExt;
+            const prefix = kind === 'record' ? 'katheryne-ptt' : 'katheryne-img';
+            const file = path.join(dir, `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
             fs.writeFileSync(file, buf);
             return file;
         };
@@ -1600,10 +1615,10 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
         if (/^base64:\/\//i.test(raw)) {
             return writeTemp(Buffer.from(raw.replace(/^base64:\/\//i, '').replace(/\s+/g, ''), 'base64'));
         }
-        // Bare base64 body (only when it clearly decodes to an image).
+        // Bare base64 body (only when it clearly decodes to image/audio).
         if (!/[\\/:]/.test(raw) && /^[A-Za-z0-9+/=\s]+$/.test(raw) && raw.replace(/\s+/g, '').length > 100) {
             const buf = Buffer.from(raw.replace(/\s+/g, ''), 'base64');
-            const ext = sniffImageExt(buf);
+            const ext = sniff(buf);
             if (ext) return writeTemp(buf, ext);
         }
         if (/^https?:\/\//i.test(raw)) {
@@ -1620,16 +1635,97 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             }
             const res = await fetch(raw, { redirect: 'follow', signal: AbortSignal.timeout(30_000) });
             if (!res.ok) {
-                throw new Error(`image download failed: HTTP ${res.status} (QQ CDN URLs may only be downloadable by the client; use a local path/base64 instead)`);
+                throw new Error(`media download failed: HTTP ${res.status} (QQ CDN URLs may only be downloadable by the client; use a local path/base64 instead)`);
             }
             const declared = Number(res.headers.get('content-length') ?? 0);
-            if (declared > 20 * 1024 * 1024) throw new Error('image too large (>20MB)');
+            if (declared > 20 * 1024 * 1024) throw new Error('media too large (>20MB)');
             const buf = Buffer.from(await res.arrayBuffer());
-            if (buf.length > 20 * 1024 * 1024) throw new Error('image too large (>20MB)');
+            if (buf.length > 20 * 1024 * 1024) throw new Error('media too large (>20MB)');
             const ctype = (res.headers.get('content-type') ?? '').split(';')[0];
-            return writeTemp(buf, ctype.split('/')[1]);
+            const mimeExt = /^(image|audio)\//.test(ctype) ? ctype.split('/')[1] : '';
+            return writeTemp(buf, mimeExt);
         }
-        throw new Error(`unsupported image source: ${raw.slice(0, 48)}`);
+        throw new Error(`unsupported media source: ${raw.slice(0, 48)}`);
+    }
+
+    /**
+     * Prepare a local voice file for sending (NapCat parity): md5/size,
+     * kernel rich-media staging path, and the pttElement fields the NT
+     * sendMsg path expects.
+     */
+    private async preparePttElement(sourcePath: string, durationHint = 0): Promise<Record<string, unknown>> {
+        const crypto = await import('node:crypto');
+        const silk = await import('silk-wasm');
+        let data = fs.readFileSync(sourcePath);
+        let workPath = sourcePath;
+        let fileName = path.basename(sourcePath);
+        let duration = 0;
+        // QQ voice is SILK. SILK passes through; WAV is encoded in-process.
+        // Other containers are rejected with an explicit supported-format
+        // error instead of silently sending something unplayable.
+        if (!silk.isSilk(data)) {
+            if (!silk.isWav(data)) {
+                const ext = sniffAudioExt(data) ?? path.extname(sourcePath).replace(/^\./, '') ?? 'unknown';
+                throw new Error(`unsupported voice format: ${ext || 'unknown'} (supported: silk, wav — convert the file to WAV or SILK first)`);
+            }
+            const enc = await silk.encode(data, 0); // 0 = read sample rate from WAV
+            data = Buffer.from(enc.data);
+            duration = enc.duration / 1000;
+            const dir = this.downloadTempPath && fs.existsSync(this.downloadTempPath)
+                ? this.downloadTempPath
+                : os.tmpdir();
+            fs.mkdirSync(dir, { recursive: true });
+            workPath = path.join(dir, `katheryne-ptt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.silk`);
+            fs.writeFileSync(workPath, data);
+            fileName = path.basename(workPath);
+        } else {
+            try { duration = silk.getDuration(data) / 1000; } catch { /* use hint */ }
+        }
+        const hint = Number(durationHint) || 0;
+        if (duration <= 0) duration = hint;
+        // Last resort: NapCat's size-based estimate (~3 KB/s).
+        if (duration <= 0) duration = Math.max(1, Math.floor(data.length / 1024 / 3));
+        const md5 = crypto.createHash('md5').update(data).digest('hex');
+        const fileSize = data.length;
+        const msgService = this.services?.msg;
+        let mediaPath = workPath;
+        try {
+            mediaPath = await (msgService as any).getRichMediaFilePathForGuild({
+                md5HexStr: md5,
+                fileName,
+                elementType: 4, // PTT
+                elementSubType: 0,
+                thumbSize: 0,
+                needCreate: true,
+                downloadType: 1,
+                file_uuid: '',
+            });
+            if (mediaPath && mediaPath !== workPath) {
+                fs.mkdirSync(path.dirname(String(mediaPath)), { recursive: true });
+                fs.copyFileSync(workPath, String(mediaPath));
+            }
+        } catch { /* fall back to original path */ }
+        return {
+            elementType: 4,
+            elementId: '',
+            pttElement: {
+                fileName,
+                filePath: String(mediaPath),
+                md5HexStr: md5,
+                fileSize: String(fileSize),
+                duration,
+                formatType: 1,
+                voiceType: 1,
+                voiceChangeType: 0,
+                canConvert2Text: true,
+                waveAmplitudes: [0, 18, 9, 23, 16, 17, 16, 15, 44, 17, 24, 20, 14, 15, 17],
+                fileSubId: '',
+                playState: 1,
+                autoConvertText: 0,
+                storeID: 0,
+                otherBusinessInfo: { aiVoiceType: 0 },
+            },
+        };
     }
 
     /**
@@ -1847,6 +1943,15 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 // Prepare local-file image segments before hitting the kernel.
                 for (let i = 0; i < elements.length; i++) {
                     const el = elements[i] as Record<string, unknown>;
+                    if (el?.elementType === 4) {
+                        const ptt = el.pttElement as Record<string, unknown> | undefined;
+                        const src = String(ptt?.filePath ?? '');
+                        if (src) {
+                            const local = await self.materializeMediaSource(src, 'record');
+                            elements[i] = await self.preparePttElement(local, Number(ptt?.duration ?? 0)) as never;
+                        }
+                        continue;
+                    }
                     if (el?.elementType !== 2) continue;
                     const pic = el.picElement as Record<string, unknown> | undefined;
                     const src = String(pic?.sourcePath ?? '');
@@ -1854,12 +1959,12 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                     // Paths, data:/base64:/file:/http(s) URLs, bare base64.
                     let local: string;
                     try {
-                        local = await self.materializeImageSource(src);
+                        local = await self.materializeMediaSource(src, 'image');
                     } catch (e) {
                         // Some clients send file=<name> plus a separate url.
                         const alt = String(pic?.picSubUrl ?? '');
                         if (!alt || alt === src) throw e;
-                        local = await self.materializeImageSource(alt);
+                        local = await self.materializeMediaSource(alt, 'image');
                     }
                     elements[i] = await self.prepareImageElement(local) as never;
                 }

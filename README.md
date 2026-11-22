@@ -14,7 +14,7 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 - **无 asar 解密、不修改磁盘二进制**：只改明文 `resources/app/package.json` 的 `main` 字段
 - **默认进程足迹极小**：无代码 trampoline；仅 1 个约 17KB 的原生插件在首次 poke 时懒加载并常驻，改 16 字节 RELRO 表项并恢复页权限（详见 [docs/poke.md](docs/poke.md)）
 - **无 renderer 注入**：headless 直接驱动内核，QQ 渲染进程不启动
-- **消息段**：text / at / face / image / record / reply / json / file（`file` 目前只支持接收群文件消息，发送会被忽略）；字符串消息按 CQ 码解析（`auto_escape` 可关闭）；图片支持本地路径、`data:` URI、`base64://`、HTTP(S) URL
+- **消息段**：text / at / face / image / record / reply / json / file（`file` 目前只支持接收群文件消息，发送会被忽略）；字符串消息按 CQ 码解析（`auto_escape` 可关闭）；图片支持本地路径、`data:` URI、`base64://`、HTTP(S) URL；语音支持 SILK 直发与 WAV 内置转码，其它格式明确报错
 - **事件**：message / message_sent / notice（撤回、戳一戳、群变动、群文件、群名片、禁言）/ request / meta_event，字段与 NapCat 对齐（`sender.role`、CQ `raw_message`、`message_seq`/`real_seq`、30s 心跳）
 
 ## 兼容性
@@ -233,7 +233,7 @@ docker run -d --name katheryne \
 
 `get_friend_list` / 陌生人 / 群成员查询均返回数字 QQ 号与完整资料：好友列表通过内核 profile 服务把 uid 解析为 uin（批量 `getCoreAndBaseInfo` 返回 `Map<uid,{coreInfo,baseInfo}>`，按普通对象读取会得到空表；现已按 Map 解析，并保留逐 uid 回退）；`get_credentials` 返回 public.md 要求的 `{cookies, csrf_token}`。
 
-### 图片 / 表情发送
+### 图片 / 语音 / 表情发送
 
 `image` 段的 `file` 支持以下来源（数组消息与 CQ 字符串均可）：
 
@@ -249,6 +249,16 @@ docker run -d --name katheryne \
 
 CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（逗号不会被当作参数分隔符）。
 `face` 段直接发送 QQ 小表情（如 `[CQ:face,id=14]`）；Unicode emoji 走 `text` 段。临时图片文件位于 QQ 下载目录，`clean_cache` 会一并清理。
+
+`record` 段的 `file` 支持与图片相同的来源（本地路径 / `file://` / `data:` / `base64://` / 裸 base64 / HTTP(S) URL），并按以下方式处理：
+
+| 输入格式 | 处理 |
+|---|---|
+| SILK | 直接发送 |
+| WAV | 内置 `silk-wasm` 编码为 SILK，无需额外依赖 |
+| 其它格式（MP3 / AMR / OGG / FLAC / M4A 等） | 明确返回 `unsupported voice format: <ext> (supported: silk, wav)`，请先转成 WAV 或 SILK |
+
+时长优先从 SILK/WAV 内容读取，其次使用 `record` 段可选的 `duration` 参数，最后按约 3KB/s 估算。编码后的临时 `.silk` 文件位于 QQ 下载目录，`clean_cache` 会清理。
 
 ### 扩展动作
 
