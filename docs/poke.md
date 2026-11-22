@@ -1,57 +1,61 @@
-# 主动 Poke（戳一戳）调查结论 — QQ Linux 3.2.35-54395
+# 主动 Poke（戳一戳）— QQ Linux 3.2.35-54395
 
-## 结论
+## 结论：可用
 
-**主动发送 poke 在 3.2.35 上当前没有可用的实现路径。** 接收 poke（notice 事件 `poke`）完整可用。
+- **发送**：`group_poke` / `friend_poke` 已实现，经 `NodeIKernelMSFService.sendMsfRequest`
+  二进制 SSO 通道发送 OIDB `0xED3_1`（群聊实测送达）。
+- **接收**：notice 事件 `poke` 完整可用（灰条 `jsonGrayTipElement` 解析）。
 
-## 调查过的全部路径
+## 工作原理（3.2.35 特有）
 
-### 1. NapCat MoeHoo hook（`MoeHoo.linux.x64.node`）— 架构性不可用
+三个必要条件，缺一包就被内核静默丢弃：
 
-- `InitHook(sendHex, recvHex, cb, o3)`：hex 经 `strtoull` 解析后 **右移 1 位**，因此调用方必须传
-  `realRva << 1` 的十六进制串（packet.json 里存的就是左移过的值）。
-- 内部：`getRva2Addr` 用 `dl_iterate_phdr` + `strstr("wrapper.node")` 取模块 load bias，
-  funchook 对 `bias + rva` 装 trampoline。send/recv hook 均为**被动监听**（filter 字符串
-  `"fucktr.pc.o3..."` 只重写 o3 ecology 的 cmd，不改包内容）。
-- 我们定位并验证了 3.2.35 的候选函数（trampoline 字节 `e9 ...` 实测写入）：
-  - `0x65f9110` / `0x65f92d0`（3.2.34 NapCat 锚点，签名在本文件中逐字节唯一命中）— **该函数在
-    3.2.35 的登录后路径上不再被调用**
-  - `MSF::MSFSDK::sendPacket` @ `0x670dd20`（`readelf --dyn-syms` 导出符号）— 函数开头的
-    MSF 初始化 flag（`0x917dd58`）运行时为 0，**整条旧 MSFSDK 发送栈在 3.2.35 已停用**。
-    这与 NapCat 的 `packet.json` 偏移表止步于 3.2.34-53644 完全一致。
+1. **MSF 二进制通道**。`session.getMSFService().sendMsfRequest(seq, cmd, data, options)`
+   是内核真正的 SSO 发包接口。注意：
+   - `data` 必须是**真 TypedArray**（`new Uint8Array(buf)`）。绑定用
+     `napi_get_typedarray_info` 读取；Node `Buffer` 是 `typeof "object"`，会被静默忽略
+     （同时 NAPI 绑定对其它类型也不报错，只返回 `undefined`）。
+   - 该绑定是 **fire-and-forget**：调用立刻返回 `undefined`，请求在 MSF 队列里异步发出。
+     与 NapCat 对 poke 的 fire-and-forget 行为一致。
+   - `options.account` 传对端（群号 / 好友 uin），`accountType: 1`，
+     `reqTargetAccountType: 1`。
 
-### 2. `sendSsoCmdReqByContend` 原始 OIDB — 服务侧拒绝
+2. **cmd 白名单**。`sendMsfRequest` 的 C++ 实现（wrapper.node `0x3538555`）会先查两张
+   静态 cmd 表（RELRO 段，见下），不在表内直接
+   `sendMsfRequest cmd:{} need add to cmd list call ulinzeng.` 丢弃。
+   `OidbSvcTrpcTcp.0xED3_1` 不在表内 → 需要进程内 patch：
+   - `src/native/memsync.c`（编译为 `native/katheryne_memsync.node`）通过
+     `dl_iterate_phdr` 定位 wrapper.node load bias，`mprotect` 白名单页可写，
+     把表 1 第 0 项（`QQClubComm.getNewFlag`，QQ 会员功能轮询，本进程用不到）
+     重指向 `OidbSvcTrpcTcp.0xED3_1`。
+   - 表 1 形如 `{char* ptr, size_t len} × 25 @ RVA 0x8e81538`（跨版本可能变化，
+     需按 `sendMsfRequest cmd:{} need add to cmd list` 字符串交叉引用重新定位）。
+   - 原始项可通过 addon 的 `restore()` 恢复。
 
-- OIDB `0xED3_1`（{uin, groupUin|friendUin, ext=0}，protobuf 字段号 1/2/5/6，NapCat
-  `OidbSvcTrpcTcpBase` 外壳 cmd=1/subCmd=2/body=4/isReserved=12 与我们手写编码一致）。
-- 二参数 NAPI 绑定（`wrapper.node 0x39e4440`）对第二参只接受
-  string→`napi_get_value_string_utf8` / object→`napi_coerce_to_string` / number→int32，
-  任何形式最终都是 UTF-8 文本。Buffer、latin1 字符串、hex 字符串全部返回
-  `result:145 请求包解析失败`（内核在上线前解析 contend 失败）。
+3. **OIDB 包格式**（与 NapCat packet 后端一致）：
+   - `OidbSvcTrpcTcpBase`：`command(1)=0xED3`、`subCommand(2)=1`、
+     `body(4)`、`isReserved(12)=1`；
+   - `SendPoke` body：`uin(1)=目标`、`groupUin(2)` 或 `friendUin(5)`、
+     `ext(6)=0`；
+   - cmd 字符串：`OidbSvcTrpcTcp.0xED3_1`。
 
-### 3. NT face 元素发送 — 被内核降级
+## 已排除的路径（逆向结论，供参考）
 
-- `sendMsg` 发送 `faceElement{faceType:5(Poke), pokeType:1, faceIndex:0}`（含/不含
-  at 元素指向目标）→ `result:0` 接受，但内核把它降级为普通表情消息
-  （`[表情0]`），不产生 poke。
-- 真实 poke 的内核表示是 **msgType 5 灰条**，服务端下发的渲染 JSON：
-  `items=[{type:"qq",uid:发起者},{type:"img",src:"...expression.jpg",jp:"...nudgeMall..."},{txt:"戳了戳"},{...被戳者}]`
-  ——这是服务端事件描述，客户端无法通过消息元素反推构造。
+- **NapCat MoeHoo hook**：`InitHook(sendHex, recvHex, cb, o3)` 内部把 hex
+  `strtoull` 后**右移 1 位**（调用方需传 `realRva << 1`），funchook 在
+  `bias + rva` 装 trampoline，hook 本身只监听不改包。3.2.34 的锚点
+  （`0x65f92d0`）在 3.2.35 同字节同偏移存在，trampoline 写入验证成功，但
+  **旧 MSFSDK 发送栈在 3.2.35 已停用**（`MSF::MSFSDK::sendPacket` 的初始化 flag
+  `0x917dd58` 运行时为 0，函数永不执行）——这也是 NapCat `packet.json` 止步
+  3.2.34 的原因。
+- **`sendSsoCmdReqByContend`**：第二参被 NAPI 强转 UTF-8 字符串（string/object/
+  number 三分支，见绑定 `0x39e4440` + 助手 `0x6ebe4d0`），二进制必损坏；且
+  3.2.35 上对原始 OIDB 一律返回 `result:145 请求包解析失败`。
+- **NT face 元素**（`faceType:5 Poke` + `pokeType:1`）：`sendMsg` 返回 `result:0`
+  但内核降级为普通表情消息。真实 poke 是服务端渲染的灰条，客户端元素无法构造。
 
-### 4. 其它
+## 依赖与构建
 
-- NT 内核 API 面（`NodeIKernelMsgService` 等类型定义）没有任何 poke 发送方法；
-  NapCat 的 `group_poke/friend_poke` action 也只走 PacketApi（native hook），无内核回退。
-- SnowLuma 架构（ptrace 注入 + RTTI 解析 MSFService）同样依赖已被移除的旧发送路径。
-
-## 接收侧（可用）
-
-`poke` notice 事件完整实现于 `src/core/runtime.ts` `emitGrayTip`：解析
-`jsonGrayTipElement.jsonStr.items` 中的两个 uid，经 `profile.getUserSimpleInfo` 批量转 uin。
-
-## 如果未来要恢复
-
-1. 等 NapCat 更新支持 3.2.35+ 的 packet 后端（新发送路径的 RVA 进 `packet.json`），
-   本仓库 `runtime.ts` 的 `initPacketHook` 已经能直接换 RVA 使用；
-2. 或对新发送函数（`wrapper::KernelMsgService::sendSsoCmdReqByContend` 0x2f6a1ef 族尾部
-   的 cmd→handler 分发器 `0x2e44b70`）继续逆向，找到新的 wire write 点。
+- 构建：`npm run build`（内含 `scripts/build-native.sh`，需 gcc + Node 头文件；
+  产物 `dist/native/katheryne_memsync.node`，安装器随 dist 一起部署）。
+- 运行时：登录后无需额外配置，第一次 poke 时自动 patch 白名单并发送。

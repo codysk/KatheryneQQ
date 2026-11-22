@@ -858,7 +858,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
     packetDebug = false;
     packetDebugCount = 0;
     /** Log incoming face-bearing gray tips (poke shape research). */
-    pokeShapeDebug = true;
+    pokeShapeDebug = false;
 
     /** Encode a real RVA the way MoeHoo's InitHook expects (left-shifted by 1). */
     private encodeRva(rva: number): string {
@@ -942,78 +942,87 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
 
     /** Poke a user in a group or privately.
      *
-     * NOT AVAILABLE on QQ 3.2.35: the raw-SSO send path this needs was
-     * removed (see docs/poke.md). We keep the API surface but always report
-     * failure so callers don't mistake a degraded plain-face message for a
-     * delivered poke. See docs/poke.md for the full investigation.
+     * Path: NodeIKernelMSFService.sendMsfRequest — the kernel's binary SSO
+     * channel. Working combination verified on 3.2.35-54395:
+     *   - payload = OIDB 0xED3_1 wrapped in OidbSvcTrpcTcpBase, passed as a
+     *     real TypedArray (the binding reads napi_get_typedarray_info; a Node
+     *     Buffer is typeof object and is silently ignored);
+     *   - cmd must be whitelisted in the kernel's static table (RELRO), hence
+     *     the memsync patch (see ensurePokeCmdWhitelisted);
+     *   - account = peer (group code / buddy uin), accountType = 1;
+     *   - the binding is fire-and-forget: it returns undefined immediately and
+     *     MSF queues the packet, so success = call did not throw.
      */
-    private async sendPoke(_targetUin: number, _peerUin: number, _isGroup: boolean): Promise<boolean> {
-        return false;
-    }
-
-    /** Historical experiment kept for reference: NT face-element poke attempt.
-     *
-     * The kernel accepts this shape (result:0) but degrades it to a plain
-     * face message — incoming pokes are server-rendered gray tips that
-     * cannot be reconstructed from client elements.
-     */
-    private async sendPokeFaceExperiment(targetUin: number, peerUin: number, isGroup: boolean): Promise<boolean> {
+    private async sendPoke(targetUin: number, peerUin: number, isGroup: boolean): Promise<boolean> {
         try {
-            const msgService = this.services?.msg as any;
-            if (!msgService?.sendMsg) return false;
-            let targetUid = this.uinToUid.get(String(targetUin)) ?? '';
-            if (!targetUid) {
-                // Cold cache: ask the profile service (uid is keyed by uin there).
-                try {
-                    const profile = this.services?.profile as any;
-                    // getCoreAndBaseInfo requires uids; instead query via group member list of the peer group.
-                    if (isGroup) {
-                        const group = this.services?.group as any;
-                        const members = await group?.getAllMemberList?.(String(peerUin), true);
-                        const infos = (members?.result?.infos ?? members?.infos ?? {}) as unknown;
-                        const mm = infos as Map<string, Record<string, any>>;
-                        for (const [uid, info] of (typeof mm.entries === 'function' ? [...mm.entries()] : Object.entries(infos as Record<string, Record<string, any>>))) {
-                            const uin = String(info?.uin ?? info?.coreInfo?.uin ?? '');
-                            if (uin) { this.uidToUin.set(uid, uin); this.uinToUid.set(uin, uid); }
-                        }
-                        targetUid = this.uinToUid.get(String(targetUin)) ?? '';
-                    }
-                } catch { /* resolution failed */ }
-            }
-            if (!targetUid) {
-                console.error('[poke-debug] no uid for target', targetUin);
+            const msf = this.services?.msf as any;
+            if (typeof msf?.sendMsfRequest !== 'function') {
+                console.error('[poke] sendMsfRequest not available on this kernel');
                 return false;
             }
-            const peer = isGroup
-                ? { chatType: 2, peerUid: String(peerUin), guildId: '' }
-                : { chatType: 1, peerUid: targetUid, guildId: '' };
-            const elements: Array<Record<string, unknown>> = [
-                {
-                    elementType: 1, // TEXT carrying the @-mention of the poke target
-                    elementId: '',
-                    textElement: { content: '', atType: 1, atUid: targetUid, atNtUid: targetUid, atTinyId: '' },
-                },
-                {
-                    elementType: 6, // FACE carrying the poke action
-                    elementId: '',
-                    faceElement: {
-                        faceIndex: 0,
-                        faceType: 5, // FaceType.Poke
-                        pokeType: 1, // POKE_TYPE_POKE
-                        faceText: '',
-                    },
-                },
-            ];
-            const ret = await Promise.race([
-                Promise.resolve(msgService.sendMsg('0', peer, elements, new Map())),
-                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
-            ]) as Record<string, unknown> | undefined;
-            console.error('[poke-debug] sendMsg response:', JSON.stringify(ret)?.slice(0, 300));
-            const result = Number((ret as { result?: number })?.result ?? 0);
-            return result === 0;
+            // The kernel drops cmds missing from its static whitelist — add ours.
+            await this.ensurePokeCmdWhitelisted();
+            if (!this.pokeCmdWhitelisted) {
+                console.error('[poke] cmd whitelist patch not applied; packet would be dropped');
+                return false;
+            }
+            const body = this.buildPokeBody(targetUin, peerUin, isGroup);
+            const packet = this.buildOidb(0xED3, 1, body);
+            const seq = String(Date.now() % 1000000000);
+            msf.sendMsfRequest(seq, 'OidbSvcTrpcTcp.0xED3_1', new Uint8Array(packet), {
+                sendTimeout: 5000,
+                sendTimeoutOnSlowNet: 10000,
+                resendNum: 0,
+                sendOptions: 0,
+                reqTargetAccountType: 1,
+                account: String(isGroup ? peerUin : targetUin),
+                accountType: 1,
+                transInfoMap: new Map(),
+            });
+            return true;
         } catch (e) {
-            console.error('[poke-debug] error', e instanceof Error ? e.message : e);
+            console.error('[poke] error', e instanceof Error ? e.message : e);
             return false;
+        }
+    }
+
+    /** One-time repoint of a harmless MSF whitelist entry to the poke cmd.
+     *
+     * sendMsfRequest drops cmds missing from its two static tables (RELRO,
+     * see docs/poke.md). Our tiny native addon mprotects the table page and
+     * repoints entry "QQClubComm.getNewFlag" (unused QQ-club poller) at
+     * OidbSvcTrpcTcp.0xED3_1. Idempotent; original entry restorable.
+     */
+    private memsyncMod: { exports: { patch?: (cmd: string) => string; restore?: () => string } } | null = null;
+    private pokeCmdWhitelisted = false;
+    private async ensurePokeCmdWhitelisted(): Promise<void> {
+        if (this.pokeCmdWhitelisted) return;
+        try {
+            const fsMod = await import('node:fs');
+            const fs = fsMod.default ?? fsMod;
+            const pathMod = await import('node:path');
+            const path = pathMod.default ?? pathMod;
+            const { fileURLToPath } = await import('node:url');
+            const here = path.dirname(fileURLToPath(import.meta.url));
+            const candidates = [
+                path.resolve(here, '../native/katheryne_memsync.node'),
+                '/mnt/d/project/KatheryneQQ/native/katheryne_memsync.node',
+            ];
+            const modPath = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+            if (!modPath) {
+                console.error('[poke-whitelist] memsync addon not found');
+                return;
+            }
+            const mod = this.memsyncMod ?? { exports: {} as { patch?: (cmd: string) => string; restore?: () => string } };
+            if (!this.memsyncMod) {
+                (process as unknown as { dlopen: (m: unknown, p: string) => void }).dlopen(mod, modPath);
+                this.memsyncMod = mod;
+            }
+            const r = mod.exports.patch?.('OidbSvcTrpcTcp.0xED3_1');
+            this.pokeCmdWhitelisted = typeof r === 'string' && r.startsWith('patched');
+            console.error('[poke-whitelist]', r);
+        } catch (e) {
+            console.error('[poke-whitelist] error', e instanceof Error ? e.message : e);
         }
     }
 
