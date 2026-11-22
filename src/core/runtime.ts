@@ -97,6 +97,24 @@ class KatheryneRuntime {
     /** groupCode -> { at, uin -> display name } for @-segment rendering. */
     private memberNickCache = new Map<string, { at: number; byUin: Map<string, string> }>();
     private groupListCache = new Map<string, Record<string, unknown>>();
+    /** fileKey -> media element location (get_image / get_record downloads). */
+    private mediaIndex = new Map<string, {
+        peer: { chatType: number; peerUid: string; guildId?: string };
+        msgId: string;
+        elementId: string;
+        kind: 'image' | 'record';
+        fileName?: string;
+        fileSize?: number;
+        url?: string;
+        localPath?: string;
+    }>();
+    private downloadTempPath = '';
+    /** pending rich-media downloads keyed by msgId|elementId */
+    private pendingMediaDownloads = new Map<string, {
+        resolve: (path: string) => void;
+        reject: (err: Error) => void;
+        timer: ReturnType<typeof setTimeout>;
+    }>();
 
     async start(): Promise<void> {
         // 1. Console + network up first (works pre-login).
@@ -290,6 +308,7 @@ class KatheryneRuntime {
         this.selfNick = nick || uin;
         try {
             const sessionConfig = this.loginFlow!.buildSessionConfig(uin, uid);
+            this.downloadTempPath = sessionConfig.defaultFileDownloadPath;
             const sessionMod = await import('../nt/session.js');
             const { session, ready } = sessionMod.initSession(this.kernel!.wrapper, sessionConfig) as unknown as {
                 session: unknown;
@@ -363,6 +382,19 @@ class KatheryneRuntime {
                 }
             },
             onAddSendMsg: (m: RawMessage) => void this.emitMessage(m, true),
+            onRichMediaDownloadComplete: (info: Record<string, any>) => {
+                console.error('[rich-media-download]', JSON.stringify(info)?.slice(0, 400));
+                const mid = String(info?.msgId ?? '');
+                const eid = String(info?.msgElementId ?? info?.elementId ?? '');
+                const key = `${mid}|${eid}`;
+                const pending = this.pendingMediaDownloads.get(key);
+                if (!pending) return;
+                clearTimeout(pending.timer);
+                this.pendingMediaDownloads.delete(key);
+                const p = String(info?.filePath ?? '');
+                if (p) pending.resolve(p);
+                else pending.reject(new Error('download completed without filePath'));
+            },
             onRecvMsgSvrRspTransInfo: () => undefined,
             onMsgEventListUpdate: () => undefined,
             onSendMsgError: () => undefined,
@@ -1072,6 +1104,68 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
      * server/local ids, so quoting them would otherwise point at an id that
      * never appeared in our event stream. msgSeq is stable across both.
      */
+    /** Index a media element so get_image/get_record can ask the kernel to download it. */
+    private rememberMediaElement(key: string, meta: {
+        peer: { chatType: number; peerUid: string; guildId?: string };
+        msgId: string;
+        elementId: string;
+        kind: 'image' | 'record';
+        fileName?: string;
+        fileSize?: number;
+        url?: string;
+        localPath?: string;
+    }): void {
+        if (!key) return;
+        this.mediaIndex.set(key, meta);
+        if (meta.url) this.mediaIndex.set(meta.url, meta);
+        if (this.mediaIndex.size > 4000) {
+            const first = this.mediaIndex.keys().next().value;
+            if (first) this.mediaIndex.delete(first);
+        }
+    }
+
+    /** Drive NodeIKernelMsgService.downloadRichMedia for one element. */
+    private async downloadRichMedia(meta: {
+        peer: { chatType: number; peerUid: string; guildId?: string };
+        msgId: string;
+        elementId: string;
+    }, timeoutMs = 120_000): Promise<string> {
+        const svc = this.requireServices().msg as unknown as Record<string, any>;
+        if (typeof svc.downloadRichMedia !== 'function') throw new Error('kernel downloadRichMedia unavailable');
+        const key = `${meta.msgId}|${meta.elementId}`;
+        const done = new Promise<string>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pendingMediaDownloads.delete(key);
+                reject(new Error('rich media download timeout'));
+            }, timeoutMs);
+            this.pendingMediaDownloads.set(key, { resolve, reject, timer });
+        });
+        try {
+            await svc.downloadRichMedia([{
+                fileModelId: '0',
+                downSourceType: 0,
+                downloadSourceType: 0,
+                triggerType: 1,
+                msgId: meta.msgId,
+                chatType: meta.peer.chatType,
+                peerUid: meta.peer.peerUid,
+                elementId: meta.elementId,
+                thumbSize: 0,
+                downloadType: 1,
+                filePath: '',
+            }]);
+        } catch (e) {
+            const pending = this.pendingMediaDownloads.get(key);
+            if (pending) {
+                clearTimeout(pending.timer);
+                this.pendingMediaDownloads.delete(key);
+                pending.reject(e instanceof Error ? e : new Error(String(e)));
+            }
+            throw e;
+        }
+        return await done;
+    }
+
     private async resolveReplyLocalId(peer: { chatType: number; peerUid: string; guildId?: string }, seq: string): Promise<string | null> {
         try {
             const svc = this.requireServices().msg;
@@ -1122,6 +1216,8 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                     selfUid: this.selfUid,
                     peer: { chatType, peerUid, guildId: '' },
                     resolveReplyId: (p2, seq) => this.resolveReplyLocalId(p2, seq),
+                    msgId: mid,
+                    rememberMedia: (key, meta) => this.rememberMediaElement(key, meta),
                 },
             );
             const event = {
@@ -1418,6 +1514,8 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                         selfUid: self.selfUid,
                         peer,
                         resolveReplyId: (p2, seq) => self.resolveReplyLocalId(p2, seq),
+                        msgId: String(raw.msgId ?? ''),
+                        rememberMedia: (key, meta) => self.rememberMediaElement(key, meta),
                     },
                 );
                 return {
@@ -1443,6 +1541,8 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                             selfUid: self.selfUid,
                             peer,
                             resolveReplyId: (p2, seq) => self.resolveReplyLocalId(p2, seq),
+                            msgId: String(raw.msgId ?? ''),
+                            rememberMedia: (key, meta) => self.rememberMediaElement(key, meta),
                         },
                     );
                     out.push({
@@ -1660,6 +1760,183 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             },
             async sendPoke(targetUin, peerUin, isGroup) {
                 return await self.sendPoke(Number(targetUin), Number(peerUin), isGroup);
+            },
+            async getForwardMsg(msgId) {
+                const svc = self.requireServices().msg;
+                const cachedPeer = self.msgPeerCache.get(String(msgId));
+                if (!cachedPeer) throw new Error('cannot resolve message peer (forward message not seen by this session)');
+                const fPeer = { chatType: cachedPeer.chatType, peerUid: cachedPeer.peerUid, guildId: '' };
+                const rootRes = await svc.getMsgsByMsgId(fPeer, [String(msgId)]);
+                const root = ((rootRes?.result?.msgList ?? rootRes?.msgList ?? []) as Array<Record<string, any>>)[0];
+                if (!root) throw new Error('forward message not found');
+                const rootId = String(root.msgId);
+                const nodes: Array<Record<string, unknown>> = [];
+                const walk = async (parentMsgId: string, depth: number): Promise<void> => {
+                    if (depth > 8) return;
+                    const r = await svc.getMultiMsg(fPeer, rootId, parentMsgId);
+                    const list = ((r?.result?.msgList ?? r?.msgList ?? []) as Array<Record<string, any>>);
+                    for (const m of list) {
+                        const segs = await ntElementsToSegments((m.elements ?? []) as Array<Record<string, unknown>>, {
+                            resolveUid: (uid) => self.uidToUin.get(uid) ?? null,
+                            selfUid: self.selfUid,
+                            peer: fPeer,
+                            msgId: String(m.msgId ?? ''),
+                            rememberMedia: (key, meta) => self.rememberMediaElement(key, meta),
+                        });
+                        nodes.push({
+                            type: 'node',
+                            data: {
+                                user_id: String(m.senderUin ?? self.uidToUin.get(String(m.senderUid ?? '')) ?? ''),
+                                nickname: String(m.senderNick ?? ''),
+                                time: Number(m.msgTime ?? 0),
+                                message: segs,
+                                content: segs,
+                            },
+                        });
+                        const hasNested = ((m.elements ?? []) as Array<Record<string, any>>).some((el) => !!el?.multiForwardMsgElement);
+                        if (hasNested) await walk(String(m.msgId ?? ''), depth + 1);
+                    }
+                };
+                await walk(rootId, 0);
+                return nodes;
+            },
+            async getGroupHonorInfo(groupCode) {
+                const group = self.requireServices().group;
+                // The NAPI binding's GroupMemberHonorReq shape varies between
+                // builds; probe the common variants until the kernel accepts one.
+                const reqVariants: Array<Record<string, unknown>> = [
+                    { groupCodes: [String(groupCode)] },
+                    { groupCode: String(groupCode) },
+                    { groupCode: Number(groupCode) },
+                    { groupCodes: [Number(groupCode)] },
+                    { group_id: String(groupCode) },
+                ];
+                let res: any = null;
+                for (const req of reqVariants) {
+                    try {
+                        const r = await group.getGroupHonorList(req);
+                        const code = Number(r?.errCode ?? r?.result?.errCode ?? 0);
+                        console.error('[honor-info]', JSON.stringify(req), '->', JSON.stringify(r)?.slice(0, 300));
+                        if (code === 0) { res = r; break; }
+                    } catch (e) {
+                        console.error('[honor-info] variant failed', JSON.stringify(req), e instanceof Error ? e.message : e);
+                    }
+                }
+                const raw = (res?.result ?? res ?? {}) as Record<string, any>;
+                const list: Array<Record<string, any>> = Array.isArray(raw)
+                    ? raw as unknown as Array<Record<string, any>>
+                    : ((raw.honorList ?? raw.list ?? raw.honors ?? []) as Array<Record<string, any>>);
+                const mapHonor = (items: Array<Record<string, any>>) => items.map((it) => ({
+                    user_id: String(it?.uin ?? it?.user_id ?? ''),
+                    nickname: String(it?.name ?? it?.nickname ?? ''),
+                    avatar: String(it?.avatar ?? ''),
+                    description: String(it?.desc ?? it?.description ?? ''),
+                }));
+                const pick = (t: number) => mapHonor(list.filter((it) => Number(it?.type ?? it?.honorType ?? -1) === t));
+                return {
+                    current_talkative: pick(1)[0] ?? {},
+                    talkative_list: pick(1),
+                    performer_list: pick(2),
+                    legend_list: pick(3),
+                    emotion_list: pick(6),
+                    strong_newbie_list: [],
+                };
+            },
+            async getCredentials(domain) {
+                const misc = self.requireServices().misc;
+                let cookies = '';
+                try {
+                    const r = await misc.getCookies(String(domain ?? ''));
+                    cookies = String(r?.result?.cookies ?? '');
+                } catch { /* cookies unavailable on this build */ }
+                const m = /(?:^|;\s*)skey=([^;]+)/.exec(cookies);
+                let token = 0;
+                if (m) {
+                    let h = 5381;
+                    for (const ch of m[1]) h += (h << 5) + ch.charCodeAt(0);
+                    token = h & 0x7fffffff;
+                }
+                return { cookies, token };
+            },
+            async getMedia(file, outFormat) {
+                const key = String(file ?? '');
+                if (!key) throw new Error('file or file_id is required');
+                if (/^https?:\/\//i.test(key)) {
+                    return { file: key, url: key, file_name: key.split('/').pop() ?? '', file_size: '' };
+                }
+                if (key.startsWith('/') && fs.existsSync(key)) {
+                    return { file: key, url: key, file_name: path.basename(key), file_size: String(fs.statSync(key).size) };
+                }
+                let lookup = key;
+                try { lookup = decodeURIComponent(key); } catch { /* keep as-is */ }
+                const meta = self.mediaIndex.get(key) ?? self.mediaIndex.get(lookup);
+                if (!meta) throw new Error('file not found (only media from messages seen by this session can be fetched)');
+                const urlFallback = (): Record<string, unknown> => ({
+                    file: meta.url as string,
+                    url: meta.url as string,
+                    file_name: meta.fileName ?? '',
+                    file_size: String(meta.fileSize ?? 0),
+                });
+                let outFile = '';
+                if (meta.localPath && fs.existsSync(meta.localPath)) {
+                    outFile = meta.localPath;
+                } else if (meta.elementId) {
+                    try {
+                        outFile = await self.downloadRichMedia(meta, 8_000);
+                    } catch (e) {
+                        console.error('[get_media] kernel download failed:', e instanceof Error ? e.message : e);
+                        if (meta.url) return urlFallback();
+                        throw e;
+                    }
+                } else if (meta.url) {
+                    return urlFallback();
+                } else {
+                    throw new Error('media element cannot be downloaded (no element id / url)');
+                }
+                let fileName = meta.fileName ?? path.basename(outFile);
+                let fileSize = meta.fileSize ?? (fs.existsSync(outFile) ? fs.statSync(outFile).size : 0);
+                if (meta.kind === 'record' && outFormat) {
+                    const ext = path.extname(outFile).replace('.', '').toLowerCase();
+                    const want = String(outFormat).toLowerCase();
+                    if (want && want !== ext) {
+                        try {
+                            const { execFileSync } = await import('node:child_process');
+                            const converted = `${outFile}.${want}`;
+                            execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', outFile, converted], { stdio: 'ignore' });
+                            outFile = converted;
+                            fileName = `${path.basename(outFile, path.extname(outFile))}.${want}`;
+                            fileSize = fs.statSync(outFile).size;
+                        } catch {
+                            console.error('[get_record] ffmpeg conversion unavailable, returning original format');
+                        }
+                    }
+                }
+                const result: Record<string, unknown> = {
+                    file: outFile,
+                    url: meta.url || outFile,
+                    file_name: fileName,
+                    file_size: String(fileSize),
+                };
+                if (meta.kind === 'record' && fileSize > 0 && fileSize <= 8 * 1024 * 1024) {
+                    try { result.base64 = fs.readFileSync(outFile).toString('base64'); } catch { /* ignore */ }
+                }
+                return result;
+            },
+            async restart(delaySec) {
+                const delay = Math.max(0, Number(delaySec) || 0);
+                console.error(`[katheryne] restart requested (delay=${delay}s)`);
+                setTimeout(() => process.exit(0), delay * 1000);
+            },
+            async cleanCache() {
+                self.msgPeerCache.clear();
+                self.memberNickCache.clear();
+                self.mediaIndex.clear();
+                if (self.downloadTempPath && fs.existsSync(self.downloadTempPath)) {
+                    for (const entry of fs.readdirSync(self.downloadTempPath)) {
+                        try { fs.rmSync(path.join(self.downloadTempPath, entry), { recursive: true, force: true }); } catch { /* ignore */ }
+                    }
+                }
+                return { cleared: true };
             },
             async getCookies(_domain) {
                 const misc = self.requireServices().misc;

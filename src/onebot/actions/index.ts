@@ -57,6 +57,13 @@ export interface ActionContext {
     // misc
     getCookies(domain: string): Promise<string>;
     sendPoke(targetUin: string, peerUin: string, isGroup: boolean): Promise<boolean>;
+    // extended public API (v11 public.md parity)
+    getForwardMsg(msgId: string): Promise<Array<Record<string, unknown>>>;
+    getGroupHonorInfo(groupCode: string): Promise<Record<string, unknown>>;
+    getCredentials(domain: string): Promise<{ cookies: string; token: number }>;
+    getMedia(file: string, outFormat?: string): Promise<Record<string, unknown>>;
+    restart(delaySec?: number): Promise<void>;
+    cleanCache(): Promise<Record<string, unknown>>;
 }
 
 export interface ActionParams {
@@ -287,6 +294,34 @@ const actions: Record<string, ActionHandler> = {
         if (!ok) throw new ActionError(1500, 'poke send failed');
         return {};
     },
+    // ---------- public API parity ----------
+    get_forward_msg: async (p, ctx) => {
+        const mid = String(p.message_id ?? p.id ?? '');
+        if (!mid) throw new ActionError(1400, 'message_id is required');
+        return { messages: await ctx.getForwardMsg(mid) };
+    },
+    get_group_honor_info: async (p, ctx) => {
+        const gid = str(p, 'group_id');
+        const info = await ctx.getGroupHonorInfo(gid);
+        return { group_id: Number(gid), ...info };
+    },
+    get_credentials: async (p, ctx) => await ctx.getCredentials(String(p.domain ?? '')),
+    get_record: async (p, ctx) => {
+        const file = String(p.file ?? p.file_id ?? '');
+        return await ctx.getMedia(file, p.out_format ? String(p.out_format) : undefined);
+    },
+    get_image: async (p, ctx) => await ctx.getMedia(String(p.file ?? p.file_id ?? '')),
+    set_restart: async (p, ctx) => {
+        await ctx.restart(Number(p.delay ?? 0));
+        return {};
+    },
+    clean_cache: async (_p, ctx) => await ctx.cleanCache(),
+    // QQNT kernel has no anonymous-group / special-title APIs (NapCat omits
+    // them too); surface a clear protocol-level error instead of silence.
+    set_group_anonymous_ban: async () => { throw new ActionError(1404, 'not supported on QQNT (no kernel API)'); },
+    set_group_anonymous: async () => { throw new ActionError(1404, 'not supported on QQNT (no kernel API)'); },
+    set_group_special_title: async () => { throw new ActionError(1404, 'not supported on QQNT (no kernel API)'); },
+
     get_cookies: async (p, ctx) => ({ cookies: await ctx.getCookies(str(p, 'domain')) }),
     get_csrf_token: async () => ({ token: 0 }),
 };

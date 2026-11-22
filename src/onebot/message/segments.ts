@@ -247,6 +247,19 @@ export async function ntElementsToSegments(
         selfUid: string;
         peer?: { chatType: number; peerUid: string; guildId?: string };
         resolveReplyId?: (peer: { chatType: number; peerUid: string; guildId?: string }, seq: string, serverId: string) => Promise<string | null>;
+        /** Message id of the raw message being converted (media index keys). */
+        msgId?: string;
+        /** Register media elements so get_image / get_record can download them. */
+        rememberMedia?: (key: string, meta: {
+            peer: { chatType: number; peerUid: string; guildId?: string };
+            msgId: string;
+            elementId: string;
+            kind: 'image' | 'record';
+            fileName?: string;
+            fileSize?: number;
+            url?: string;
+            localPath?: string;
+        }) => void;
     },
 ): Promise<OB11Segment[]> {
     const out: OB11Segment[] = [];
@@ -285,26 +298,53 @@ export async function ntElementsToSegments(
                 const url = origin
                     ? (origin.startsWith('http') ? origin : `https://gchat.qpic.cn${origin}`)
                     : String(pe.picSubUrl ?? pe.url ?? '');
+                const imgKey = String(pe.fileName ?? pe.md5HexStr ?? '');
                 out.push({
                     type: 'image',
                     data: {
-                        file: String(pe.fileName ?? pe.md5HexStr ?? ''),
+                        file: imgKey,
                         url,
                         file_size: Number(pe.fileSize ?? 0),
                     },
                 });
+                if (imgKey && ctx.msgId && ctx.peer && ctx.rememberMedia) {
+                    ctx.rememberMedia(imgKey, {
+                        peer: ctx.peer,
+                        msgId: ctx.msgId,
+                        elementId: String(el.elementId ?? ''),
+                        kind: 'image',
+                        fileName: imgKey,
+                        fileSize: Number(pe.fileSize ?? 0),
+                        url,
+                        localPath: String(pe.sourcePath ?? pe.filePath ?? ''),
+                    });
+                }
                 break;
             }
             case ELEMENT_TYPE.PTT: {
                 const pe = (el.pttElement ?? {}) as Record<string, unknown>;
+                const pttKey = String(pe.fileName ?? '');
+                const pttUrl = String(pe.url ?? '');
                 out.push({
                     type: 'record',
                     data: {
-                        file: String(pe.fileName ?? ''),
-                        url: String(pe.url ?? ''),
+                        file: pttKey,
+                        url: pttUrl,
                         duration: Number(pe.duration ?? pe.voiceLength ?? 0),
                     },
                 });
+                if (pttKey && ctx.msgId && ctx.peer && ctx.rememberMedia) {
+                    ctx.rememberMedia(pttKey, {
+                        peer: ctx.peer,
+                        msgId: ctx.msgId,
+                        elementId: String(el.elementId ?? ''),
+                        kind: 'record',
+                        fileName: pttKey,
+                        fileSize: Number(pe.fileSize ?? 0),
+                        url: pttUrl,
+                        localPath: String(pe.filePath ?? ''),
+                    });
+                }
                 break;
             }
             case ELEMENT_TYPE.FACE: {

@@ -8,7 +8,7 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 
 ## 特性
 
-- **完整 OneBot v11 动作集**（34 个动作：32 标准 + `group_poke`/`friend_poke` 扩展），本机实测 29 个通过，详见[支持矩阵](#onebot-v11-支持矩阵)
+- **完整 OneBot v11 动作集**（44 个动作：38 个 public API 全量 + 6 个扩展），实测 32 个通过，详见[支持矩阵](#onebot-v11-支持矩阵)
 - **主动戳一戳可用**：经 MSF 二进制通道发送 OIDB 0xED3_1（含原生插件放行内核 cmd 白名单），群聊/私聊均实测送达，原理见 [docs/poke.md](docs/poke.md)
 - **Web 控制台**：扫码登录、事件流、动作调试器、运行日志
 - **无 asar 解密、无二进制 patch**：只改明文 `resources/app/package.json` 的 `main` 字段
@@ -162,11 +162,28 @@ docker run -d --name katheryne \
 
 响应 envelope 遵循 OB11 规范：`{ status, retcode, data, message?, echo }`；retcode：0 成功 / 1400 参数错误 / 1403 未授权 / 1404 动作不支持 / 1500 内部错误。
 
-### ✅ 已实测通过（29）
+### ✅ 已实测通过（32）
 
 `send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`（真撤回）、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_card`、`set_group_name`、`set_group_avatar`、`can_send_image`、`can_send_record`、`get_version_info`、`get_status`、`get_cookies`、`get_csrf_token`、`group_poke`、`friend_poke`
 
 群管理类均做过可逆恢复验证（禁言→解禁、改名→改回、换头像→恢复原图）；内核返回非 0 时动作会正确报错（错误码透传）。
+
+### ◻️ 已实现、受限或未实测（4）
+
+| 动作 | 说明 |
+|---|---|
+| `get_forward_msg` | 实现（`getMultiMsg` 逐层解析，支持嵌套）；需被转发的消息在本会话事件中出现过；已用普通消息验证内核调用路径 |
+| `get_group_honor_info` | 实现（`getGroupHonorList`）；当前 3.2.35 构建返回 `param(group_id) error`，返回空荣誉列表 |
+| `get_record` | 实现（本地路径 / CDN URL / 内核下载，`out_format` 可用系统 ffmpeg 转换）；暂缺真实语音样本实测 |
+| `set_restart` | 实现（延迟退出进程，依赖守护进程/容器 restart 策略拉起）；会中断会话，未做破坏性实测 |
+
+### ⚠️ 平台不支持（3，返回 1404）
+
+| 动作 | 原因 |
+|---|---|
+| `set_group_anonymous` | QQNT 内核无匿名群相关 API（NapCat 同样未实现） |
+| `set_group_anonymous_ban` | 同上 |
+| `set_group_special_title` | QQNT 内核无群头衔设置 API（NapCat 同样未实现） |
 
 ### ⚠️ 权限受限（1）
 
@@ -190,6 +207,8 @@ docker run -d --name katheryne \
 `message`（私聊/群聊/自发）、`notice`（群增减员/禁言/踢出/群撤回/戳一戳）、`request`（好友/加群请求）、`meta_event`（lifecycle/heartbeat）。
 
 ### 扩展动作
+
+此外还提供 `get_msg_history`、`mark_msg_as_read`、`get_group_info_simple`、`set_group_avatar` 等 go-cqhttp 风格扩展。
 
 `group_poke` / `friend_poke`（go-cqhttp 风格参数）：经 MSF 二进制通道发送 OIDB 0xED3_1，依赖原生插件 `katheryne_memsync.node` 在进程内放行内核 cmd 白名单。完整原理与失效路径分析见 [docs/poke.md](docs/poke.md)。
 
