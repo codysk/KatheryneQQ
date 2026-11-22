@@ -323,7 +323,7 @@ class KatheryneRuntime {
             },
             onRecvMsg: (msgs: RawMessage[]) => {
                 for (const m of msgs ?? []) {
-                    this.emitMessage(m, false);
+                    void this.emitMessage(m, false);
                 }
             },
             onMsgInfoListUpdate: async (msgs: RawMessage[]) => {
@@ -344,7 +344,7 @@ class KatheryneRuntime {
                     if (Number((m as Record<string, unknown>).msgType ?? 0) === 5) void this.emitGrayTip(m);
                 }
             },
-            onAddSendMsg: (m: RawMessage) => this.emitMessage(m, true),
+            onAddSendMsg: (m: RawMessage) => void this.emitMessage(m, true),
             onRecvMsgSvrRspTransInfo: () => undefined,
             onMsgEventListUpdate: () => undefined,
             onSendMsgError: () => undefined,
@@ -1048,7 +1048,24 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
 
     // ---------------- message -> OB11 ----------------
 
-    private emitMessage(m: RawMessage, sent: boolean): void {
+    /**
+     * Map a reply element's server-side msgId onto the id this runtime exposes
+     * (the kernel's local msgId). Messages we sent ourselves carry different
+     * server/local ids, so quoting them would otherwise point at an id that
+     * never appeared in our event stream. msgSeq is stable across both.
+     */
+    private async resolveReplyLocalId(peer: { chatType: number; peerUid: string; guildId?: string }, seq: string): Promise<string | null> {
+        try {
+            const svc = this.requireServices().msg;
+            const r = await svc.getMsgsBySeqAndCount(peer, String(seq), 1, true, true);
+            const raw = ((r?.result?.msgList ?? r?.msgList ?? []) as Array<Record<string, any>>)[0];
+            return raw?.msgId ? String(raw.msgId) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    private async emitMessage(m: RawMessage, sent: boolean): Promise<void> {
         try {
             // Harvest uid<->uin pairs from every message (covers friends and strangers).
             const senderUid = String(m.senderUid ?? '');
@@ -1075,9 +1092,14 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             if (mid && peerUid) {
                 this.msgPeerCache.set(mid, { chatType, peerUid });
             }
-            const segments = ntElementsToSegments(
+            const segments = await ntElementsToSegments(
                 (m.elements ?? []) as Array<Record<string, unknown>>,
-                { resolveUid: (uid) => this.uidToUin.get(uid) ?? null, selfUid: this.selfUid },
+                {
+                    resolveUid: (uid) => this.uidToUin.get(uid) ?? null,
+                    selfUid: this.selfUid,
+                    peer: { chatType, peerUid, guildId: '' },
+                    resolveReplyId: (p2, seq) => this.resolveReplyLocalId(p2, seq),
+                },
             );
             const event = {
                 time: Math.floor(Date.now() / 1000),
@@ -1366,9 +1388,14 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 const r = await svc.getMsgsByMsgId(peer, [msgId]);
                 const raw = (r?.result?.msgList ?? r?.msgList ?? [])[0] as RawMessage | undefined;
                 if (!raw) throw new Error('message not found');
-                const segments = ntElementsToSegments(
+                const segments = await ntElementsToSegments(
                     (raw.elements ?? []) as Array<Record<string, unknown>>,
-                    { resolveUid: (uid) => self.uidToUin.get(uid) ?? null, selfUid: self.selfUid },
+                    {
+                        resolveUid: (uid) => self.uidToUin.get(uid) ?? null,
+                        selfUid: self.selfUid,
+                        peer,
+                        resolveReplyId: (p2, seq) => self.resolveReplyLocalId(p2, seq),
+                    },
                 );
                 return {
                     message_id: String(raw.msgId ?? msgId),
@@ -1384,20 +1411,27 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 // kernel: getMsgsIncludeSelf(peer, startMsgId, count, isReverseOrder)
                 const r = await svc.getMsgsIncludeSelf(peer, msgId, count, false);
                 const list = (r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[];
-                return list.map((raw) => {
-                    const segments = ntElementsToSegments(
+                const out: Array<Record<string, unknown>> = [];
+                for (const raw of list) {
+                    const segments = await ntElementsToSegments(
                         (raw.elements ?? []) as Array<Record<string, unknown>>,
-                        { resolveUid: (uid) => self.uidToUin.get(uid) ?? null, selfUid: self.selfUid },
+                        {
+                            resolveUid: (uid) => self.uidToUin.get(uid) ?? null,
+                            selfUid: self.selfUid,
+                            peer,
+                            resolveReplyId: (p2, seq) => self.resolveReplyLocalId(p2, seq),
+                        },
                     );
-                    return {
+                    out.push({
                         message_id: String(raw.msgId ?? ''),
                         real_id: Number(raw.msgSeq ?? 0),
                         sender: { user_id: String(raw.senderUin ?? '') },
                         time: Number(raw.msgTime ?? 0),
                         message: segments,
                         raw_message: segmentsToRawText(segments as OB11Segment[]),
-                    };
-                });
+                    });
+                }
+                return out;
             },
             async markRead(peer) {
                 const svc = self.requireServices().msg;

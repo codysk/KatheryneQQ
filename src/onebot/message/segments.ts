@@ -235,11 +235,20 @@ export async function segmentsToNtElements(
 
 /**
  * Convert a NT RawMessage's elements into OB11 segments.
+ *
+ * `resolveReplyId` maps the reply element's server-side msgId onto the id this
+ * framework exposes for the same message (our local msgId space), so reply
+ * segments point at ids clients actually received in message events.
  */
-export function ntElementsToSegments(
+export async function ntElementsToSegments(
     elements: RawElement[],
-    ctx: { resolveUid: (uid: string) => string | null; selfUid: string },
-): OB11Segment[] {
+    ctx: {
+        resolveUid: (uid: string) => string | null;
+        selfUid: string;
+        peer?: { chatType: number; peerUid: string; guildId?: string };
+        resolveReplyId?: (peer: { chatType: number; peerUid: string; guildId?: string }, seq: string, serverId: string) => Promise<string | null>;
+    },
+): Promise<OB11Segment[]> {
     const out: OB11Segment[] = [];
     for (const el of elements ?? []) {
         const t = Number(el.elementType ?? 0);
@@ -305,16 +314,17 @@ export function ntElementsToSegments(
             }
             case ELEMENT_TYPE.REPLY: {
                 const re = (el.replyElement ?? {}) as Record<string, unknown>;
-                // replayMsgId is the canonical NT msgId (same space as message
-                // events); sourceMsgIdInRecords is a local record index.
-                const replyId = String(re.replayMsgId ?? '');
-                out.push({
-                    type: 'reply',
-                    data: {
-                        id: replyId && replyId !== '0' ? replyId : String(re.sourceMsgIdInRecords ?? ''),
-                        seq: String(re.replayMsgSeq ?? ''),
-                    },
-                });
+                // replayMsgId is the server-side id of the quoted message and
+                // sourceMsgIdInRecords a local record index. Map the former onto
+                // our exposed id space via msgSeq when possible.
+                const serverId = String(re.replayMsgId ?? '');
+                const seq = String(re.replayMsgSeq ?? '');
+                let id = serverId && serverId !== '0' ? serverId : String(re.sourceMsgIdInRecords ?? '');
+                if (seq && ctx.resolveReplyId && ctx.peer) {
+                    const local = await ctx.resolveReplyId(ctx.peer, seq, id);
+                    if (local) id = local;
+                }
+                out.push({ type: 'reply', data: { id, seq } });
                 break;
             }
             case ELEMENT_TYPE.ARK: {
