@@ -24,7 +24,7 @@ RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
     fi \
     && apt-get update \
     && apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
-        ca-certificates fonts-noto-cjk \
+        ca-certificates fonts-noto-cjk ffmpeg \
         libgtk-3-0 libgdk-pixbuf-2.0-0 libnotify4 libsecret-1-0 libxss1 \
         libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
         libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \

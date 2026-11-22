@@ -14,7 +14,7 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 - **无 asar 解密、不修改磁盘二进制**：只改明文 `resources/app/package.json` 的 `main` 字段
 - **默认进程足迹极小**：无代码 trampoline；仅 1 个约 17KB 的原生插件在首次 poke 时懒加载并常驻，改 16 字节 RELRO 表项并恢复页权限（详见 [docs/poke.md](docs/poke.md)）
 - **无 renderer 注入**：headless 直接驱动内核，QQ 渲染进程不启动
-- **消息段**：text / at / face / image / record / reply / json / file（`file` 目前只支持接收群文件消息，发送会被忽略）；字符串消息按 CQ 码解析（`auto_escape` 可关闭）；图片支持本地路径、`data:` URI、`base64://`、HTTP(S) URL；语音支持 SILK 直发与 WAV 内置转码，其它格式明确报错
+- **消息段**：text / at / face / image / record / reply / json / file（`file` 目前只支持接收群文件消息，发送会被忽略）；字符串消息按 CQ 码解析（`auto_escape` 可关闭）；图片支持本地路径、`data:` URI、`base64://`、HTTP(S) URL；语音支持 SILK 直发、WAV 内置转码，其它格式/采样率经 ffmpeg 转换
 - **事件**：message / message_sent / notice（撤回、戳一戳、群变动、群文件、群名片、禁言）/ request / meta_event，字段与 NapCat 对齐（`sender.role`、CQ `raw_message`、`message_seq`/`real_seq`、30s 心跳）
 
 ## 兼容性
@@ -24,7 +24,7 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 | 平台 | Linux x86_64（AppImage / deb / rpm） |
 | QQ 版本 | **3.2.35-54395**（已验证）。其它 3.2.x 未逐一验证，消息/群管等核心内核 API 通常可用；**poke 的白名单 RVA 是版本相关的**，未命中时动作返回 `poke send failed`，日志会说明 whitelist 原因 |
 | Node | ≥ 20（构建用；运行在 QQ 自带 Electron 内） |
-| 构建依赖 | gcc + Node 头文件（编译约 17KB 的原生插件） |
+| 构建依赖 | gcc + Node 头文件（编译约 17KB 的原生插件）；非 WAV/SILK 或非标准采样率语音需要系统 ffmpeg（Docker 镜像已内置） |
 
 ## 原理
 
@@ -255,8 +255,9 @@ CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（�
 | 输入格式 | 处理 |
 |---|---|
 | SILK | 直接发送 |
-| WAV | 内置 `silk-wasm` 编码为 SILK，无需额外依赖 |
-| 其它格式（MP3 / AMR / OGG / FLAC / M4A 等） | 明确返回 `unsupported voice format: <ext> (supported: silk, wav)`，请先转成 WAV 或 SILK |
+| WAV（单声道 16-bit，8/12/16/24/32/44.1/48kHz） | 内置 `silk-wasm` 编码为 SILK，无需额外依赖 |
+| 其它 WAV 采样率/立体声、MP3 / AMR / OGG / FLAC / M4A 等 | 经系统 `ffmpeg` 转为 24kHz 单声道 PCM，再编码 SILK；Docker 镜像已内置 ffmpeg |
+| ffmpeg 不可用 | 返回明确错误 `voice transcode failed: ...`，提示安装 ffmpeg 或改用受支持的 WAV/SILK |
 
 时长优先从 SILK/WAV 内容读取，其次使用 `record` 段可选的 `duration` 参数，最后按约 3KB/s 估算。编码后的临时 `.silk` 文件位于 QQ 下载目录，`clean_cache` 会清理。
 

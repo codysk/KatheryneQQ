@@ -1653,6 +1653,24 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
      * kernel rich-media staging path, and the pttElement fields the NT
      * sendMsg path expects.
      */
+    private async decodeAudioWithFfmpeg(sourcePath: string): Promise<Buffer> {
+        const { execFile } = await import('node:child_process');
+        return await new Promise<Buffer>((resolve, reject) => {
+            execFile(
+                'ffmpeg',
+                ['-v', 'error', '-i', sourcePath, '-f', 's16le', '-ac', '1', '-ar', '24000', 'pipe:1'],
+                { encoding: 'buffer', maxBuffer: 32 * 1024 * 1024 },
+                (err, stdout) => {
+                    if (err) {
+                        reject(new Error(`voice transcode failed: ${err.message} (install ffmpeg, or provide mono 16-bit WAV at 8/12/16/24/32/44.1/48kHz or SILK)`));
+                    } else {
+                        resolve(stdout as Buffer);
+                    }
+                },
+            );
+        });
+    }
+
     private async preparePttElement(sourcePath: string, durationHint = 0): Promise<Record<string, unknown>> {
         const crypto = await import('node:crypto');
         const silk = await import('silk-wasm');
@@ -1660,15 +1678,27 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
         let workPath = sourcePath;
         let fileName = path.basename(sourcePath);
         let duration = 0;
-        // QQ voice is SILK. SILK passes through; WAV is encoded in-process.
-        // Other containers are rejected with an explicit supported-format
-        // error instead of silently sending something unplayable.
+        // QQ voice is SILK. SILK passes through; simple WAV goes straight to
+        // silk-wasm. Other containers / odd WAV rates are normalized to
+        // mono 24kHz PCM by ffmpeg first.
         if (!silk.isSilk(data)) {
-            if (!silk.isWav(data)) {
-                const ext = sniffAudioExt(data) ?? path.extname(sourcePath).replace(/^\./, '') ?? 'unknown';
-                throw new Error(`unsupported voice format: ${ext || 'unknown'} (supported: silk, wav — convert the file to WAV or SILK first)`);
+            let pcmInput: Buffer = data;
+            let sampleRate = 0;
+            let useFfmpeg = !silk.isWav(data);
+            if (!useFfmpeg) {
+                try {
+                    const fmt = silk.getWavFileInfo(data).fmt;
+                    const allowed = [8000, 12000, 16000, 24000, 32000, 44100, 48000];
+                    useFfmpeg = fmt.numberOfChannels !== 1 || fmt.bitsPerSample !== 16 || !allowed.includes(fmt.sampleRate);
+                } catch {
+                    useFfmpeg = true;
+                }
             }
-            const enc = await silk.encode(data, 0); // 0 = read sample rate from WAV
+            if (useFfmpeg) {
+                pcmInput = await this.decodeAudioWithFfmpeg(sourcePath);
+                sampleRate = 24000;
+            }
+            const enc = await silk.encode(pcmInput, sampleRate);
             data = Buffer.from(enc.data);
             duration = enc.duration / 1000;
             const dir = this.downloadTempPath && fs.existsSync(this.downloadTempPath)
