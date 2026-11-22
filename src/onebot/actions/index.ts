@@ -18,6 +18,8 @@ export interface ActionContext {
     selfUin: string;
     selfUid: string;
     resolveUin(uin: string): string | null;
+    /** Async uin->uid resolution that actually waits for the kernel uix query. */
+    ensureUid?(uin: string): Promise<string | null>;
     resolveUid(uid: string): string | null;
     resolveMsgPeer(msgId: string): { chatType: number; peerUid: string } | null;
     // messaging
@@ -89,8 +91,7 @@ function bool(params: ActionParams, key: string, def = false): boolean {
     return s === 'true' || s === '1' || s === 'yes';
 }
 
-/** group_id / user_id -> NT peer. */
-function peerOf(params: ActionParams, ctx: ActionContext, opts: { requireGroup?: boolean } = {}): PeerRef {
+/** group_id / user_id -> NT peer. */async function peerOf(params: ActionParams, ctx: ActionContext, opts: { requireGroup?: boolean } = {}): Promise<PeerRef> {
     const groupId = params.group_id as string | undefined;
     const userId = params.user_id as string | undefined;
     const messageType = params.message_type as string | undefined;
@@ -102,11 +103,34 @@ function peerOf(params: ActionParams, ctx: ActionContext, opts: { requireGroup?:
     }
     if (messageType === 'private' || messageType === undefined) {
         if (opts.requireGroup) throw new ActionError(1400, 'group_id required');
-        const uid = ctx.resolveUin(String(userId ?? ''));
+        const uid = await ensureUidOf(ctx, String(userId ?? ''));
         if (!uid) throw new ActionError(1400, `cannot resolve user ${userId} to uid`);
         return { chatType: 1, peerUid: uid };
     }
     throw new ActionError(1400, `unsupported message_type ${messageType}`);
+}
+
+/** Wait-capable uin -> uid: hot cache first, then the kernel uix query. */
+async function ensureUidOf(ctx: ActionContext, uin: string): Promise<string | null> {
+    const cached = ctx.resolveUin(uin);
+    if (cached) return cached;
+    if (ctx.ensureUid) return await ctx.ensureUid(uin);
+    return null;
+}
+
+/**
+ * Resolve the peer for a message_id-only action: prefer explicit
+ * user_id/group_id, then the cache of peers for messages this process has
+ * seen (sent or received). OB11 clients commonly call delete_msg/get_msg
+ * with just a message_id.
+ */
+async function peerForMsg(params: ActionParams, ctx: ActionContext, messageId: string): Promise<PeerRef> {
+    if (params.user_id || params.group_id || params.message_type) {
+        return await peerOf(params, ctx);
+    }
+    const cached = ctx.resolveMsgPeer(messageId);
+    if (cached) return cached as PeerRef;
+    throw new ActionError(1400, 'cannot resolve message peer; provide user_id/group_id (bot can only resolve ids of messages it has seen)');
 }
 
 function segmentsOf(params: ActionParams): OB11Segment[] {
@@ -119,34 +143,34 @@ function segmentsOf(params: ActionParams): OB11Segment[] {
 const actions: Record<string, ActionHandler> = {
     // ---------- messaging ----------
     send_private_msg: async (p, ctx) => {
-        const r = await ctx.sendMessage(peerOf(p, ctx), segmentsToNtElements(segmentsOf(p), ctx));
+        const r = await ctx.sendMessage(await peerOf(p, ctx), segmentsToNtElements(segmentsOf(p), ctx));
         return { message_id: r.msgId };
     },
     send_group_msg: async (p, ctx) => {
-        const r = await ctx.sendMessage(peerOf(p, ctx, { requireGroup: true }), segmentsToNtElements(segmentsOf(p), ctx));
+        const r = await ctx.sendMessage(await peerOf(p, ctx, { requireGroup: true }), segmentsToNtElements(segmentsOf(p), ctx));
         return { message_id: r.msgId };
     },
     send_msg: async (p, ctx) => {
-        const r = await ctx.sendMessage(peerOf(p, ctx), segmentsToNtElements(segmentsOf(p), ctx));
+        const r = await ctx.sendMessage(await peerOf(p, ctx), segmentsToNtElements(segmentsOf(p), ctx));
         return { message_id: r.msgId };
     },
     delete_msg: async (p, ctx) => {
         const mid = str(p, 'message_id');
-        const peer = (p.user_id || p.group_id) ? peerOf(p, ctx) : (ctx.resolveMsgPeer(mid) ?? peerOf(p, ctx));
-        await ctx.deleteMsg(peer, mid);
+        await ctx.deleteMsg(await peerForMsg(p, ctx, mid), mid);
         return {};
     },
     get_msg: async (p, ctx) => {
         const mid = str(p, 'message_id');
-        const peer = (p.user_id || p.group_id) ? peerOf(p, ctx) : (ctx.resolveMsgPeer(mid) ?? peerOf(p, ctx));
-        return await ctx.getMsg(peer, mid);
+        return await ctx.getMsg(await peerForMsg(p, ctx, mid), mid);
     },
     get_msg_history: async (p, ctx) => {
-        const list = await ctx.getMsgHistory(peerOf(p, ctx), String(p.message_id ?? ''), num(p, 'count', 20));
+        const list = await ctx.getMsgHistory(await peerOf(p, ctx), String(p.message_id ?? ''), num(p, 'count', 20));
         return { messages: list };
     },
     mark_msg_as_read: async (p, ctx) => {
-        await ctx.markRead(peerOf(p, ctx));
+        const mid = String(p.message_id ?? '');
+        const peer = mid && !(p.user_id || p.group_id) ? await peerForMsg(p, ctx, mid) : await peerOf(p, ctx);
+        await ctx.markRead(peer);
         return {};
     },
 
@@ -154,12 +178,12 @@ const actions: Record<string, ActionHandler> = {
     get_login_info: async (_p, ctx) => await ctx.getLoginInfo(),
     get_friend_list: async (_p, ctx) => await ctx.getFriendList(),
     get_stranger_info: async (p, ctx) => {
-        const uid = ctx.resolveUin(str(p, 'user_id'));
+        const uid = await ensureUidOf(ctx, str(p, 'user_id'));
         if (!uid) throw new ActionError(1400, 'cannot resolve user');
         return await ctx.getStrangerInfo(uid);
     },
     send_like: async (p, ctx) => {
-        const uid = ctx.resolveUin(str(p, 'user_id'));
+        const uid = await ensureUidOf(ctx, str(p, 'user_id'));
         if (!uid) throw new ActionError(1400, 'cannot resolve user');
         await ctx.sendLike(uid, num(p, 'times', 1));
         return {};
@@ -171,12 +195,12 @@ const actions: Record<string, ActionHandler> = {
     get_group_info_simple: async (p, ctx) => await ctx.getGroupInfo(str(p, 'group_id')),
     get_group_member_list: async (p, ctx) => await ctx.getGroupMemberList(str(p, 'group_id')),
     get_group_member_info: async (p, ctx) => {
-        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        const memberUid = await ensureUidOf(ctx, str(p, 'user_id'));
         if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
         return await ctx.getGroupMemberInfo(str(p, 'group_id'), memberUid);
     },
     set_group_ban: async (p, ctx) => {
-        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        const memberUid = await ensureUidOf(ctx, str(p, 'user_id'));
         if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
         await ctx.setGroupBan(str(p, 'group_id'), memberUid, num(p, 'duration', 1800));
         return {};
@@ -186,7 +210,7 @@ const actions: Record<string, ActionHandler> = {
         return {};
     },
     set_group_kick: async (p, ctx) => {
-        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        const memberUid = await ensureUidOf(ctx, str(p, 'user_id'));
         if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
         await ctx.setGroupKick(str(p, 'group_id'), [memberUid], bool(p, 'reject_add_request', false));
         return {};
@@ -196,7 +220,7 @@ const actions: Record<string, ActionHandler> = {
         return {};
     },
     set_group_card: async (p, ctx) => {
-        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        const memberUid = await ensureUidOf(ctx, str(p, 'user_id'));
         if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
         await ctx.setGroupCard(str(p, 'group_id'), memberUid, str(p, 'card'));
         return {};
@@ -206,7 +230,7 @@ const actions: Record<string, ActionHandler> = {
         return {};
     },
     set_group_admin: async (p, ctx) => {
-        const memberUid = ctx.resolveUin(str(p, 'user_id'));
+        const memberUid = await ensureUidOf(ctx, str(p, 'user_id'));
         if (!memberUid) throw new ActionError(1400, 'cannot resolve member');
         await ctx.setGroupAdmin(str(p, 'group_id'), memberUid, bool(p, 'enable', true));
         return {};

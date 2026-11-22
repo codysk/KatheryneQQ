@@ -1051,6 +1051,12 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             const isGroup = chatType === 2;
             const peerUid = String(m.peerUid ?? '');
             const peerUin = this.uidToUin.get(peerUid) ?? (String(m.peerUin ?? '') || peerUid);
+            // Cache message_id -> peer so message_id-only actions (get_msg,
+            // delete_msg, mark_msg_as_read) work for received messages too.
+            const mid = String(m.msgId ?? '');
+            if (mid && peerUid) {
+                this.msgPeerCache.set(mid, { chatType, peerUid });
+            }
             const segments = ntElementsToSegments(
                 (m.elements ?? []) as Array<Record<string, unknown>>,
                 { resolveUid: (uid) => this.uidToUin.get(uid) ?? null, selfUid: this.selfUid },
@@ -1184,6 +1190,30 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                         }).catch(() => undefined);
                     }
                 } catch { /* fallthrough */ }
+                return null;
+            },
+            async ensureUid(uin: string): Promise<string | null> {
+                if (uin === self.selfUin) return self.selfUid;
+                const cached = self.uinToUid.get(uin);
+                if (cached) return cached;
+                try {
+                    const uix = self.services?.uix;
+                    if (uix?.getUid) {
+                        const rr = await uix.getUid([uin]) as Record<string, any>;
+                        const uidInfo = rr?.uidInfo;
+                        const uid = uidInfo?.get?.(uin) ?? uidInfo?.[uin]
+                            ?? rr?.result?.uidInfo?.get?.(uin) ?? rr?.result?.uidInfo?.[uin];
+                        if (uid && !String(uid).includes('*')) {
+                            self.uinToUid.set(uin, String(uid));
+                            self.uidToUin.set(String(uid), uin);
+                            return String(uid);
+                        }
+                    }
+                } catch { /* fallthrough */ }
+                // Last resort: harvest from any cached group member list.
+                for (const [uid, u] of self.uidToUin) {
+                    if (u === uin) return uid;
+                }
                 return null;
             },
             resolveMsgPeer(msgId: string): { chatType: number; peerUid: string } | null {
@@ -1439,13 +1469,22 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             },
             async getGroupMemberInfo(groupCode, memberUid) {
                 const group = self.requireServices().group;
-                const res = await group.getGroupMemberInfo(groupCode, memberUid, false);
-                const mem = (res?.result ?? res) as Record<string, unknown>;
+                // The kernel exposes no per-member getter: pull the full list
+                // and pick the member (same source NapCat's cache uses).
+                const res = await group.getAllMemberList(groupCode, true);
+                const result = (res?.result ?? res ?? {}) as Record<string, unknown>;
+                const infosRaw = result?.infos as unknown;
+                const asMap = infosRaw as Map<string, Record<string, unknown>>;
+                const mem = (typeof asMap?.get === 'function'
+                    ? asMap.get(memberUid)
+                    : (infosRaw as Record<string, Record<string, unknown>>)?.[memberUid]) as Record<string, unknown> | undefined;
+                if (!mem) throw new Error('member not found');
+                const roleNum = Number(mem.role ?? 0);
                 return {
-                    user_id: String(mem.uin ?? ''),
+                    user_id: String(mem.uin ?? self.uidToUin.get(memberUid) ?? ''),
                     nickname: String(mem.nick ?? ''),
                     card: String(mem.cardName ?? ''),
-                    role: Number(mem.role ?? 0) === 1 ? 'owner' : Number(mem.role ?? 0) === 2 ? 'admin' : 'member',
+                    role: roleNum === 1 ? 'owner' : roleNum === 2 ? 'admin' : 'member',
                     level: Number(mem.level ?? 0),
                     title: String(mem.title ?? ''),
                 };
