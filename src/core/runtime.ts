@@ -90,6 +90,8 @@ class KatheryneRuntime {
     private uidToUin = new Map<string, string>();
     /** msgId -> peer, harvested from every message; enables message_id-only actions. */
     private msgPeerCache = new Map<string, { chatType: number; peerUid: string; senderUid?: string; senderUin?: string; msgSeq?: string }>();
+    /** groupCode -> { at, uin -> display name } for @-segment rendering. */
+    private memberNickCache = new Map<string, { at: number; byUin: Map<string, string> }>();
     private groupListCache = new Map<string, Record<string, unknown>>();
 
     async start(): Promise<void> {
@@ -1247,6 +1249,45 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             },
             resolveMsgPeer(msgId: string): { chatType: number; peerUid: string } | null {
                 return self.msgPeerCache.get(msgId) ?? null;
+            },
+            async fetchMsgByMsgId(peer, msgId) {
+                const svc = self.requireServices().msg;
+                const r = await svc.getMsgsByMsgId(peer, [String(msgId)]);
+                return ((r?.result?.msgList ?? r?.msgList ?? []) as Array<Record<string, any>>)[0];
+            },
+            async fetchMsgBySeq(peer, seq) {
+                const svc = self.requireServices().msg;
+                // getMsgsBySeqAndCount(peer, seq, count, desc, isReverseOrder)
+                const r = await svc.getMsgsBySeqAndCount(peer, String(seq), 1, true, true);
+                return ((r?.result?.msgList ?? r?.msgList ?? []) as Array<Record<string, any>>)[0];
+            },
+            async resolveMemberNickname(groupCode, uin) {
+                const now = Date.now();
+                const cached = self.memberNickCache.get(groupCode);
+                if (cached && now - cached.at < 300_000) {
+                    return cached.byUin.get(String(uin)) ?? null;
+                }
+                try {
+                    const group = self.requireServices().group;
+                    const res = await group.getAllMemberList(groupCode, true);
+                    const result = (res?.result ?? res ?? {}) as Record<string, unknown>;
+                    const ids = (result?.ids ?? []) as Array<{ uid: string }>;
+                    const infosRaw = result?.infos as unknown;
+                    const asMap = infosRaw as Map<string, Record<string, any>>;
+                    const getInfo = (uid: string) => (typeof asMap?.get === 'function'
+                        ? asMap.get(uid)
+                        : (infosRaw as Record<string, Record<string, any>>)?.[uid]);
+                    const byUin = new Map<string, string>();
+                    for (const { uid } of ids) {
+                        const info = getInfo(uid) ?? {};
+                        const u = String(info.uin ?? '');
+                        if (u) byUin.set(u, String(info.cardName || info.nick || u));
+                    }
+                    self.memberNickCache.set(groupCode, { at: now, byUin });
+                    return byUin.get(String(uin)) ?? null;
+                } catch {
+                    return null;
+                }
             },
             resolveUid(uid: string): string | null {
                 if (uid === self.selfUid) return self.selfUin;

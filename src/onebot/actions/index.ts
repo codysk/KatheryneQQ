@@ -22,6 +22,11 @@ export interface ActionContext {
     ensureUid?(uin: string): Promise<string | null>;
     resolveUid(uid: string): string | null;
     resolveMsgPeer(msgId: string): { chatType: number; peerUid: string } | null;
+    /** Kernel message lookups (reply segment resolution). */
+    fetchMsgByMsgId(peer: PeerRef, msgId: string): Promise<Record<string, any> | undefined>;
+    fetchMsgBySeq(peer: PeerRef, seq: string): Promise<Record<string, any> | undefined>;
+    /** Group member display name (card/nick) for @ rendering. */
+    resolveMemberNickname(groupCode: string, uin: string): Promise<string | null>;
     // messaging
     sendMessage(peer: PeerRef, elements: unknown[]): Promise<{ msgId: string; seq?: string }>;
     deleteMsg(peer: PeerRef, msgId: string): Promise<void>;
@@ -143,15 +148,18 @@ function segmentsOf(params: ActionParams): OB11Segment[] {
 const actions: Record<string, ActionHandler> = {
     // ---------- messaging ----------
     send_private_msg: async (p, ctx) => {
-        const r = await ctx.sendMessage(await peerOf(p, ctx), segmentsToNtElements(segmentsOf(p), ctx));
+        const peer = await peerOf(p, ctx);
+        const r = await ctx.sendMessage(peer, await segmentsToNtElements(segmentsOf(p), { ...ctx, peer }));
         return { message_id: r.msgId };
     },
     send_group_msg: async (p, ctx) => {
-        const r = await ctx.sendMessage(await peerOf(p, ctx, { requireGroup: true }), segmentsToNtElements(segmentsOf(p), ctx));
+        const peer = await peerOf(p, ctx, { requireGroup: true });
+        const r = await ctx.sendMessage(peer, await segmentsToNtElements(segmentsOf(p), { ...ctx, peer }));
         return { message_id: r.msgId };
     },
     send_msg: async (p, ctx) => {
-        const r = await ctx.sendMessage(await peerOf(p, ctx), segmentsToNtElements(segmentsOf(p), ctx));
+        const peer = await peerOf(p, ctx);
+        const r = await ctx.sendMessage(peer, await segmentsToNtElements(segmentsOf(p), { ...ctx, peer }));
         return { message_id: r.msgId };
     },
     delete_msg: async (p, ctx) => {

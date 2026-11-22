@@ -14,10 +14,37 @@ export type OB11Segment = {
 export const ChatType_C2C = 1;
 export const ChatType_Group = 2;
 
+/** NT at types (NTMsgAtType) */
+const AT_TYPE_ALL = 1;
+const AT_TYPE_ONE = 2;
+
 export interface SendMessageElement {
     elementType: number;
     elementId?: string;
     [elementName: string]: unknown;
+}
+
+export interface PeerRef {
+    chatType: number;
+    peerUid: string;
+    guildId?: string;
+}
+
+/** Context needed to build/parse elements (kernel queries live on the runtime). */
+export interface SegmentContext {
+    selfUin: string;
+    selfUid: string;
+    /** Target chat of the send (at/reply resolution depends on it). */
+    peer: PeerRef;
+    resolveUin(uin: string): string | null;
+    ensureUid?(uin: string): Promise<string | null>;
+    resolveUid(uid: string): string | null;
+    resolveMsgPeer(msgId: string): { chatType: number; peerUid: string } | null;
+    /** Kernel lookups for reply targets. */
+    fetchMsgByMsgId(peer: { chatType: number; peerUid: string; guildId?: string }, msgId: string): Promise<Record<string, any> | undefined>;
+    fetchMsgBySeq(peer: { chatType: number; peerUid: string; guildId?: string }, seq: string): Promise<Record<string, any> | undefined>;
+    /** Group member display name (card/nick) for @ rendering; optional. */
+    resolveMemberNickname?(groupCode: string, uin: string): Promise<string | null>;
 }
 
 const ELEMENT_TYPE = {
@@ -32,23 +59,23 @@ const ELEMENT_TYPE = {
     MARKDOWN: 14,
 } as const;
 
-function atTypeOf(qq: string, selfUin: string, isAll: boolean): number {
-    if (isAll) return 1; // @全体成员
-    if (qq === selfUin) return 2;
-    return 2; // NT: at by uin uses type 2 with atNtUid; group uses tinyId in atTinyId
-}
-
 /**
  * Build NT send elements from OB11 segments.
- * `context` supplies uin/uid maps needed for @-resolution.
+ *
+ * at: NT textElement carries the target UIN in `atUid` and the NT uid in
+ * `atNtUid` (atType 2), or 'all'/'all' with atType 1 for @全体成员. NT has no
+ * at element in C2C chats, so at segments are dropped there (same as NapCat).
+ *
+ * reply: NT replyElement needs the replied message's seq/id/sender from the
+ * kernel — OB11 only supplies our message_id (or seq), so we look the message
+ * up before building the element.
  */
-export function segmentsToNtElements(
+export async function segmentsToNtElements(
     segments: OB11Segment[],
-    ctx: { selfUin: string; selfUid: string; resolveUin: (uin: string) => string | null },
-): SendMessageElement[] {
+    ctx: SegmentContext,
+): Promise<SendMessageElement[]> {
     const out: SendMessageElement[] = [];
-    let atAll = false;
-    const pendingAts: Array<{ qq: string; uid: string | null }> = [];
+    const isGroup = ctx.peer.chatType === ChatType_Group;
 
     for (const seg of segments) {
         const d = seg.data ?? {};
@@ -67,44 +94,68 @@ export function segmentsToNtElements(
                 break;
             }
             case 'at': {
+                // NT has no per-user at in private chats.
+                if (!isGroup) break;
                 const qq = String(d.qq ?? '');
+                if (!qq) break;
                 if (qq === 'all') {
-                    atAll = true;
                     out.push({
                         elementType: ELEMENT_TYPE.TEXT,
                         textElement: {
                             content: '@全体成员',
-                            atType: 1,
-                            atUid: '',
+                            atType: AT_TYPE_ALL,
+                            atUid: 'all',
                             atTinyId: '',
-                            atNtUid: '',
+                            atNtUid: 'all',
                         },
                     });
-                } else {
-                    const uid = ctx.resolveUin(qq);
-                    pendingAts.push({ qq, uid });
-                    out.push({
-                        elementType: ELEMENT_TYPE.TEXT,
-                        textElement: {
-                            content: `@${(d.name as string) ?? qq} `,
-                            atType: atTypeOf(qq, ctx.selfUin, false),
-                            atUid: uid ?? '',
-                            atTinyId: '',
-                            atNtUid: uid ?? '',
-                        },
-                    });
+                    break;
                 }
+                const uid = ctx.resolveUin(qq) ?? (ctx.ensureUid ? await ctx.ensureUid(qq) : null);
+                if (!uid) throw new Error(`cannot resolve at target ${qq} to uid`);
+                let name = String(d.name ?? '');
+                if (!name && ctx.resolveMemberNickname) {
+                    name = (await ctx.resolveMemberNickname(ctx.peer.peerUid, qq)) ?? '';
+                }
+                if (!name) name = qq;
+                out.push({
+                    elementType: ELEMENT_TYPE.TEXT,
+                    textElement: {
+                        content: `@${name}`,
+                        atType: AT_TYPE_ONE,
+                        atUid: qq,        // UIN, per NT semantics
+                        atTinyId: '',
+                        atNtUid: uid,     // NT uid
+                    },
+                });
                 break;
             }
             case 'reply': {
+                const id = d.id !== undefined && d.id !== null ? String(d.id) : '';
+                const seq = d.seq !== undefined && d.seq !== null ? String(d.seq) : '';
+                if (!id && !seq) throw new Error('reply segment needs id or seq');
+                let raw: Record<string, any> | undefined;
+                if (seq) {
+                    raw = await ctx.fetchMsgBySeq(ctx.peer, seq);
+                }
+                if (!raw && id) {
+                    raw = await ctx.fetchMsgByMsgId(ctx.peer, id);
+                    if (!raw) {
+                        // Reply target may live in another chat (quoted forward etc.).
+                        const cached = ctx.resolveMsgPeer(id);
+                        if (cached) raw = await ctx.fetchMsgByMsgId(cached, id);
+                    }
+                }
+                if (!raw) throw new Error(`reply target message not found: ${id || `seq=${seq}`}`);
                 out.push({
                     elementType: ELEMENT_TYPE.REPLY,
                     replyElement: {
-                        replayMsgSeq: String(d.seq ?? ''),
-                        replyMsgTime: '0',
-                        senderUid: '',
-                        senderUin: '',
-                        senderUinStr: '',
+                        replayMsgSeq: String(raw.msgSeq ?? ''),
+                        replayMsgId: String(raw.msgId ?? ''),
+                        senderUin: String(raw.senderUin ?? ''),
+                        senderUinStr: String(raw.senderUin ?? ''),
+                        replyMsgClientSeq: String(raw.clientSeq ?? ''),
+                        replyMsgTime: String(raw.msgTime ?? ''),
                     },
                 });
                 break;
@@ -179,10 +230,6 @@ export function segmentsToNtElements(
         }
     }
 
-    // NT requires the trailing at-all marker via text element flags; the
-    // kernel accepts atType=1 inline (already emitted above).
-    void atAll;
-    void pendingAts;
     return out;
 }
 
@@ -202,10 +249,20 @@ export function ntElementsToSegments(
                 const content = String(te.content ?? '');
                 const atType = Number(te.atType ?? 0);
                 if (atType > 0) {
-                    const atUid = String(te.atNtUid ?? te.atUid ?? te.atTinyId ?? '');
-                    const uin = atUid ? ctx.resolveUid(atUid) ?? '' : 'all';
-                    out.push({ type: 'at', data: { qq: uin === ctx.selfUid ? 'all' : uin } });
-                    const rest = content.replace(/^@\S+\s?/, '');
+                    // NT stores the target UIN in atUid (atType 2), 'all' for
+                    // at-all (atType 1); older payloads only carry atNtUid.
+                    let qq = 'all';
+                    if (atType !== AT_TYPE_ALL) {
+                        const atUin = String(te.atUid ?? '');
+                        if (atUin && atUin !== '0') {
+                            qq = String(Number(atUin) >>> 0);
+                        } else {
+                            const uid = String(te.atNtUid ?? te.atTinyId ?? '');
+                            qq = uid ? (ctx.resolveUid(uid) ?? uid) : '';
+                        }
+                    }
+                    out.push({ type: 'at', data: { qq } });
+                    const rest = content.replace(/^@[^\s@]+\s?/, '');
                     if (rest) out.push({ type: 'text', data: { text: rest } });
                 } else if (content) {
                     out.push({ type: 'text', data: { text: content } });
@@ -248,7 +305,16 @@ export function ntElementsToSegments(
             }
             case ELEMENT_TYPE.REPLY: {
                 const re = (el.replyElement ?? {}) as Record<string, unknown>;
-                out.push({ type: 'reply', data: { seq: String(re.replayMsgSeq ?? '') } });
+                // replayMsgId is the canonical NT msgId (same space as message
+                // events); sourceMsgIdInRecords is a local record index.
+                const replyId = String(re.replayMsgId ?? '');
+                out.push({
+                    type: 'reply',
+                    data: {
+                        id: replyId && replyId !== '0' ? replyId : String(re.sourceMsgIdInRecords ?? ''),
+                        seq: String(re.replayMsgSeq ?? ''),
+                    },
+                });
                 break;
             }
             case ELEMENT_TYPE.ARK: {
