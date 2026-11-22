@@ -949,7 +949,9 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
      *     Buffer is typeof object and is silently ignored);
      *   - cmd must be whitelisted in the kernel's static table (RELRO), hence
      *     the memsync patch (see ensurePokeCmdWhitelisted);
-     *   - account = peer (group code / buddy uin), accountType = 1;
+     *   - account = self uin (the MSF request account context is the sending
+     *     account; passing the peer/group code makes MSF drop the request),
+     *     accountType = 1;
      *   - the binding is fire-and-forget: it returns undefined immediately and
      *     MSF queues the packet, so success = call did not throw.
      */
@@ -975,7 +977,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 resendNum: 0,
                 sendOptions: 0,
                 reqTargetAccountType: 1,
-                account: String(isGroup ? peerUin : targetUin),
+                account: String(this.selfUin),
                 accountType: 1,
                 transInfoMap: new Map(),
             });

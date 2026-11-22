@@ -17,8 +17,8 @@
      （同时 NAPI 绑定对其它类型也不报错，只返回 `undefined`）。
    - 该绑定是 **fire-and-forget**：调用立刻返回 `undefined`，请求在 MSF 队列里异步发出。
      与 NapCat 对 poke 的 fire-and-forget 行为一致。
-   - `options.account` 传对端（群号 / 好友 uin），`accountType: 1`，
-     `reqTargetAccountType: 1`。
+   - `options.account` 必须是**自己 uin**（MSF 请求账户 = 发包者上下文；传群号/对端
+     uin 会被 MSF 丢弃、服务器无感知），`accountType: 1`，`reqTargetAccountType: 1`。
 
 2. **cmd 白名单**。`sendMsfRequest` 的 C++ 实现（wrapper.node `0x3538555`）会先查两张
    静态 cmd 表（RELRO 段，见下），不在表内直接
