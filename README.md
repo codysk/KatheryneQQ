@@ -8,7 +8,7 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 
 ## 特性
 
-- **完整 OneBot v11 动作集**（44 个动作：38 个 public API 全部注册 + 6 个扩展，其中 3 个平台不支持），实测 31 个通过，详见[支持矩阵](#onebot-v11-支持矩阵)
+- **完整 OneBot v11 动作集**（46 个动作：38 个 public API 全部注册 + 8 个扩展，其中 3 个平台不支持），实测 33 个通过，详见[支持矩阵](#onebot-v11-支持矩阵)
 - **主动戳一戳可用**：经 MSF 二进制通道发送 OIDB 0xED3_1（含原生插件放行内核 cmd 白名单），群聊/私聊均实测送达，原理见 [docs/poke.md](docs/poke.md)
 - **Web 控制台**：扫码登录、事件流、动作调试器、运行日志
 - **无 asar 解密、不修改磁盘二进制**：只改明文 `resources/app/package.json` 的 `main` 字段
@@ -168,9 +168,9 @@ docker run -d --name katheryne \
 
 `message_id` 是 19 位雪花 ID 的**十进制字符串**（JSON number 会丢精度）。若客户端仍把它转成 Number 再传回，`get_msg`/`delete_msg`/`get_msg_history` 会先按精度误差窗口尝试还原；`get_msg` 仅在唯一匹配时成功，多个候选或无法匹配时返回带提示的 `message not found`（其余接口按内核结果处理）。
 
-### ✅ 已实测通过（31）
+### ✅ 已实测通过（33）
 
-`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`（真撤回）、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_card`、`set_group_name`、`set_group_avatar`、`can_send_image`、`can_send_record`、`get_version_info`、`get_status`、`get_cookies`、`get_csrf_token`、`get_credentials`、`clean_cache`、`group_poke`、`friend_poke`
+`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`（真撤回）、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_card`、`set_group_name`、`set_group_avatar`、`can_send_image`、`can_send_record`、`get_version_info`、`get_status`、`get_cookies`、`get_csrf_token`、`get_credentials`、`clean_cache`、`get_group_msg_history`、`get_friend_msg_history`、`group_poke`、`friend_poke`
 
 群管理类均做过可逆恢复验证（禁言→解禁、改名→改回、换头像→恢复原图）；内核返回非 0 时动作会失败，错误信息包含内核 code（OB11 retcode 为 1500）。
 
@@ -264,6 +264,14 @@ CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（�
 ### 扩展动作
 
 此外还提供 `get_msg_history`、`mark_msg_as_read`、`get_group_info_simple`、`set_group_avatar` 等 go-cqhttp 风格扩展。
+
+`get_group_msg_history` / `get_friend_msg_history`（go-cqhttp / NapCat 扩展，CyberGroupmate 等客户端用它补抓离线消息）：
+
+- 参数：`group_id` 或 `user_id`、可选 `message_seq`、`count`（默认 20，上限 100）、`reverse_order`（兼容 `reverseOrder`）
+- 不带 `message_seq` 时返回该会话最新 N 条；带 `message_seq` 时从该消息起翻页，游标可以是 `real_seq`，也可以是本协议端返回的雪花 `message_id`
+- 返回 `{ messages: [...] }`，每条与实时消息事件结构一致（含 `sender.nickname` / `sender.card` / `sender.role`）
+- 私聊会按对方是否为好友选择普通 C2C 或临时会话；没有记录时返回失败（`消息…不存在`），与 NapCat 行为一致
+- 灰条系统提示与空占位消息会被过滤，不计入返回条数
 
 `group_poke` / `friend_poke`（go-cqhttp 风格参数）：经 MSF 二进制通道发送 OIDB 0xED3_1，依赖原生插件 `katheryne_memsync.node` 在进程内放行内核 cmd 白名单。完整原理与失效路径分析见 [docs/poke.md](docs/poke.md)。
 

@@ -128,7 +128,10 @@ export class LoginFlow {
                 onLoginSuccess: (userid: string, uid: string, nick: string) => {
                     if (settled) return;
                     settled = true;
-                    resolve({ uin: userid, uid, nick: nick ?? userid });
+                    // Keep an empty nick empty: the kernel often reports none
+                    // here, and the runtime resolves the real one from the
+                    // profile service once the session is up.
+                    resolve({ uin: userid, uid, nick: nick ?? '' });
                 },
                 onLoginFailed: (step: number, errMsg: string) => {
                     if (settled) return;

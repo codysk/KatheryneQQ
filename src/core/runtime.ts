@@ -120,6 +120,8 @@ class KatheryneRuntime {
     private msgPeerCache = new Map<string, { chatType: number; peerUid: string; senderUid?: string; senderUin?: string; msgSeq?: string }>();
     /** groupCode -> { at, uin -> {nick, card, role} } for @ and sender meta. */
     private memberInfoCache = new Map<string, { at: number; byUin: Map<string, { nick: string; card: string; role: string }> }>();
+    /** uid/uin -> nickname for private-chat senders (LRU-bounded). */
+    private nickCache = new Map<string, string>();
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     private groupListCache = new Map<string, Record<string, unknown>>();
     /** friend-request flag (reqTime) -> {uid, reqTime}, for set_friend_add_request. */
@@ -266,7 +268,8 @@ class KatheryneRuntime {
                 const uin = String(arg?.uin ?? '');
                 const uid = String(arg?.uid ?? '');
                 this.consoleMgr?.log(`QR login succeed: ${uin}`);
-                void this.afterLogin(uin, uid, uin);
+                // The QR callback carries no nickname; afterLogin resolves it.
+                void this.afterLogin(uin, uid, '');
             },
             onLoginFailed: (step?: unknown, errMsg?: unknown) => {
                 this.loginError = `login failed step=${step}: ${String(errMsg ?? '')}`;
@@ -361,6 +364,13 @@ class KatheryneRuntime {
             this.attachGroupListener();
             this.attachBuddyListener();
             void this.cacheMappings();
+            // Quick-login often reports an empty nick; resolve the real one from
+            // the profile service (NapCat does the same for selfInfo).
+            if (!nick && uid) {
+                void this.nickOfUid(uid, uin).then((n) => {
+                    if (n) this.selfNick = n;
+                });
+            }
 
             this.phase = 'online';
             this.loginError = null;
@@ -662,6 +672,43 @@ class KatheryneRuntime {
             message_id: String(m.msgId ?? ''),
         } as never);
         this.consoleMgr?.log(`recall: ${isGroup ? 'group' : 'friend'} msg=${key}`);
+    }
+
+    /** uid -> nickname via the profile service (cached). */
+    private async nickOfUid(uid: string, uin: string): Promise<string | null> {
+        const key = uid || uin;
+        const cached = this.nickCache.get(key);
+        if (cached) return cached;
+        const profile = this.services?.profile as any;
+        let nick = '';
+        if (profile && uid) {
+            try {
+                const res = await profile.getCoreAndBaseInfo?.('nodeStore', [uid]);
+                const raw: any = res instanceof Map ? res : (res?.result?.info ?? res?.info ?? res);
+                const info = raw instanceof Map ? raw.get(uid) : raw?.[uid];
+                nick = String(info?.coreInfo?.nick ?? '');
+            } catch { /* fall through */ }
+            if (!nick) {
+                try {
+                    const d = await profile.getUserDetailInfo?.(uid);
+                    nick = String(d?.coreInfo?.nick ?? d?.nick ?? d?.detail?.simpleInfo?.coreInfo?.nick ?? '');
+                } catch { /* ignore */ }
+            }
+        }
+        if (!nick && uin && /^\d+$/.test(uin)) {
+            try {
+                const d = await profile?.getUserDetailInfoByUin?.(uin);
+                nick = String(d?.detail?.simpleInfo?.coreInfo?.nick ?? d?.coreInfo?.nick ?? '');
+            } catch { /* ignore */ }
+        }
+        if (nick) {
+            this.nickCache.set(key, nick);
+            if (this.nickCache.size > 2000) {
+                const oldest = this.nickCache.keys().next().value;
+                if (oldest !== undefined) this.nickCache.delete(oldest);
+            }
+        }
+        return nick || null;
     }
 
     /** uid -> uin (self-aware, kernel uix fallback). */
@@ -1491,6 +1538,13 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             }
             const g = this.groupListCache.get(String(peerUin)) as Record<string, unknown> | undefined;
             groupName = String(g?.group_name ?? g?.groupName ?? '');
+        } else if (senderUin) {
+            // NapCat's handlePrivateMessage: the kernel's sendNickName is often
+            // empty (or just the QQ number), so resolve the real nickname from
+            // the profile service. Friends resolve through core/base info,
+            // everyone else through getUserDetailInfo(uid).
+            const resolved = senderUin === this.selfUin ? this.selfNick : await this.nickOfUid(senderUid, senderUin);
+            if (resolved) nick = resolved;
         }
 
         const segments = await ntElementsToSegments(
@@ -2052,6 +2106,63 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 const list = ((r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[]);
                 const out: Array<Record<string, unknown>> = [];
                 for (const raw of list) out.push(await self.buildOB11Message(raw));
+                return out;
+            },
+            /**
+             * NapCat-parity history (go-cqhttp get_group_msg_history /
+             * get_friend_msg_history): no cursor -> latest N messages
+             * (getAioFirstViewLatestMsgs); with a cursor -> page from that
+             * message. The cursor may be our snowflake message_id or a real
+             * msgSeq, so disambiguate by magnitude before mapping.
+             */
+            async isBuddy(uid) {
+                try {
+                    return Boolean(await (self.requireServices().buddy as any)?.isBuddy?.(uid));
+                } catch {
+                    return false;
+                }
+            },
+            async getChatHistory(peer, cursor, count, reverseOrder): Promise<Array<Record<string, unknown>>> {
+                const svc = self.requireServices().msg as any;
+                const peerRef = { chatType: peer.chatType, peerUid: peer.peerUid, guildId: '' };
+                const limit = Math.min(Math.max(Number(count) || 20, 1), 100);
+                const cur = String(cursor ?? '').trim();
+                const hasCursor = !!cur && cur !== '0';
+                // Over-fetch, because system entries (gray tips / placeholders)
+                // are dropped afterwards; NapCat returns a full page too.
+                const fetchN = Math.min(limit * 2 + 4, 200);
+                let list: RawMessage[];
+                if (hasCursor) {
+                    let startId = cur;
+                    // Snowflake message ids are ~19 digits; msgSeq values are far
+                    // smaller. Only treat short numbers as seq, otherwise the
+                    // seq lookup silently matches a different message.
+                    if (/^\d{1,12}$/.test(cur)) {
+                        const bySeq = await svc.getMsgsBySeqAndCount(peerRef, cur, 1, true, true);
+                        const hit = ((bySeq?.result?.msgList ?? bySeq?.msgList ?? []) as RawMessage[])[0];
+                        // The kernel answers an unknown seq with the nearest
+                        // message instead of failing, so verify the seq matches.
+                        if (!hit?.msgId || String(hit.msgSeq) !== cur) throw new Error(`消息${cur}不存在`);
+                        startId = String(hit.msgId);
+                    }
+                    const r = await svc.getMsgsIncludeSelf(peerRef, self.canonicalMsgId(startId), fetchN, !!reverseOrder);
+                    list = ((r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[]);
+                } else {
+                    const r = await svc.getAioFirstViewLatestMsgs(peerRef, fetchN);
+                    list = ((r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[]);
+                }
+                // Same content filter as the realtime path: KMSGTYPENULL (1)
+                // entries are empty placeholders and KMSGTYPEGRAYTIPS (5) are
+                // system notices (both surface as uid "0" / no text).
+                list = list.filter((m) => {
+                    const t = Number((m as Record<string, unknown>).msgType ?? 0);
+                    return t !== 1 && t !== 5;
+                });
+                // NapCat throws when the page is empty; clients rely on this to
+                // detect "no history" instead of treating it as success.
+                if (list.length === 0) throw new Error(`消息${cur}不存在`);
+                const out: Array<Record<string, unknown>> = [];
+                for (const raw of list.slice(0, limit)) out.push(await self.buildOB11Message(raw));
                 return out;
             },
             async markRead(peer) {

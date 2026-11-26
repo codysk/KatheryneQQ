@@ -48,6 +48,10 @@ export interface ActionContext {
     deleteMsg(peer: PeerRef, msgId: string): Promise<void>;
     getMsg(peer: PeerRef, msgId: string): Promise<Record<string, unknown>>;
     getMsgHistory(peer: PeerRef, msgId: string, count: number): Promise<Array<Record<string, unknown>>>;
+    /** NapCat-parity chat history (latest N when cursor is empty). */
+    getChatHistory(peer: PeerRef, cursor: string, count: number, reverseOrder: boolean): Promise<Array<Record<string, unknown>>>;
+    /** Whether a uid is a friend (decides C2C vs temp C2C history peer). */
+    isBuddy?(uid: string): Promise<boolean>;
     markRead(peer: PeerRef): Promise<void>;
     // profile
     getLoginInfo(): Promise<{ user_id: number; nickname: string }>;
@@ -209,6 +213,36 @@ const actions: Record<string, ActionHandler> = {
             ? await peerOf(p, ctx)
             : await peerForMsg(p, ctx, mid);
         const list = await ctx.getMsgHistory(peer, mid, num(p, 'count', 20));
+        return { messages: list };
+    },
+    // ---------- go-cqhttp / NapCat history extensions ----------
+    // CyberGroupmate and other clients backfill offline messages through
+    // these (get_group_msg_history / get_friend_msg_history).
+    get_group_msg_history: async (p, ctx) => {
+        if (!p.group_id) throw new ActionError(1400, 'group_id is required');
+        const peer = { chatType: 2, peerUid: String(p.group_id) };
+        const list = await ctx.getChatHistory(
+            peer,
+            String(p.message_seq ?? ''),
+            num(p, 'count', 20),
+            bool(p, 'reverse_order', false) || bool(p, 'reverseOrder', false),
+        );
+        return { messages: list };
+    },
+    get_friend_msg_history: async (p, ctx) => {
+        if (!p.user_id) throw new ActionError(1400, 'user_id is required');
+        const uin = String(p.user_id);
+        const uid = await ensureUidOf(ctx, uin);
+        if (!uid) throw new ActionError(1400, `cannot resolve user ${uin} to uid`);
+        // Friends use the normal C2C peer; strangers/temp chats (e.g. a group
+        // member the bot has never added) live in the temp C2C session.
+        const chatType = (await ctx.isBuddy?.(uid)) ? 1 : 100;
+        const list = await ctx.getChatHistory(
+            { chatType, peerUid: uid },
+            String(p.message_seq ?? ''),
+            num(p, 'count', 20),
+            bool(p, 'reverse_order', false) || bool(p, 'reverseOrder', false),
+        );
         return { messages: list };
     },
     mark_msg_as_read: async (p, ctx) => {
