@@ -249,6 +249,12 @@ export async function ntElementsToSegments(
         resolveReplyId?: (peer: { chatType: number; peerUid: string; guildId?: string }, seq: string, serverId: string) => Promise<string | null>;
         /** Message id of the raw message being converted (media index keys). */
         msgId?: string;
+        /**
+         * Build a directly downloadable URL for an inbound picElement. The NT
+         * v2 path (appid 1406/1407) needs a CDN rkey only the runtime can
+         * supply; without it the CDN answers 400 "invalid rkey".
+         */
+        resolvePicUrl?(pic: Record<string, any>): string;
         /** Register media elements so get_image / get_record can download them. */
         rememberMedia?: (key: string, meta: {
             peer: { chatType: number; peerUid: string; guildId?: string };
@@ -293,11 +299,11 @@ export async function ntElementsToSegments(
             }
             case ELEMENT_TYPE.PIC: {
                 const pe = (el.picElement ?? {}) as Record<string, unknown>;
-                // originImageUrl is the relative CDN path; prefix the host.
-                const origin = String(pe.originImageUrl ?? '');
-                const url = origin
-                    ? (origin.startsWith('http') ? origin : `https://gchat.qpic.cn${origin}`)
-                    : String(pe.picSubUrl ?? pe.url ?? '');
+                // NapCat's getImageUrl: NT v2 needs an rkey; md5 path does not.
+                // Keep the raw origin path only as a last resort (it is not
+                // directly downloadable for appid 1406/1407).
+                const url = (ctx.resolvePicUrl?.(pe) as string | undefined)
+                    || String(pe.picSubUrl ?? pe.url ?? '');
                 const imgKey = String(pe.fileName ?? pe.md5HexStr ?? '');
                 out.push({
                     type: 'image',

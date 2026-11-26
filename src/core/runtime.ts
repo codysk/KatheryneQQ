@@ -120,6 +120,18 @@ class KatheryneRuntime {
     private msgPeerCache = new Map<string, { chatType: number; peerUid: string; senderUid?: string; senderUin?: string; msgSeq?: string }>();
     /** groupCode -> { at, uin -> {nick, card, role} } for @ and sender meta. */
     private memberInfoCache = new Map<string, { at: number; byUin: Map<string, { nick: string; card: string; role: string }> }>();
+    /**
+     * CDN rkey for NT v2 images (appid 1406/1407). The kernel keeps its own
+     * rkey manager but does not expose it over NAPI, so mirror NapCat's
+     * fallback: fetch from a public rkey service and cache until expiry.
+     * Images on the md5 path need no rkey.
+     */
+    private rkeyData: { group: string; private: string; expireAt: number } | null = null;
+    private rkeyFetching: Promise<void> | null = null;
+    private static readonly RKEY_SERVICES = [
+        'http://ss.xingzhige.com/music_card/rkey',
+        'https://secret-service.bietiaop.com/rkeys',
+    ];
     /** uid/uin -> nickname for private-chat senders (LRU-bounded). */
     private nickCache = new Map<string, string>();
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -364,6 +376,7 @@ class KatheryneRuntime {
             this.attachGroupListener();
             this.attachBuddyListener();
             void this.cacheMappings();
+            void this.ensureRkey(true);
             // Quick-login often reports an empty nick; resolve the real one from
             // the profile service (NapCat does the same for selfInfo).
             if (!nick && uid) {
@@ -1286,6 +1299,61 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
      * server/local ids, so quoting them would otherwise point at an id that
      * never appeared in our event stream. msgSeq is stable across both.
      */
+    /**
+     * Refresh the CDN rkey when stale. Never throws: on failure the previous
+     * value (if any) is kept and callers get '' so they fall back to the
+     * md5-style URL.
+     */
+    private async ensureRkey(force = false): Promise<void> {
+        const now = Date.now();
+        if (!force && this.rkeyData && this.rkeyData.expireAt - now > 60_000) return;
+        if (this.rkeyFetching) return await this.rkeyFetching;
+        this.rkeyFetching = (async () => {
+            for (const url of KatheryneRuntime.RKEY_SERVICES) {
+                try {
+                    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+                    if (!res.ok) continue;
+                    let data = (await res.json()) as Record<string, any>;
+                    if (data && typeof data === 'object' && data.data && typeof data.data === 'object') data = data.data;
+                    // Values arrive as "&rkey=<token>" (or already bare).
+                    const strip = (v: unknown): string => String(v ?? '').replace(/^&?rkey=/, '');
+                    const group = strip(data?.group_rkey);
+                    const priv = strip(data?.private_rkey);
+                    const expireAt = (Number(data?.expired_time) || 0) * 1000;
+                    if (!group && !priv) continue;
+                    this.rkeyData = { group, private: priv, expireAt: expireAt || now + 10 * 60_000 };
+                    return;
+                } catch {
+                    // try the next service
+                }
+            }
+            // All services failed: keep serving a still-valid cached value.
+            if (!this.rkeyData || this.rkeyData.expireAt <= now) this.rkeyData = null;
+        })();
+        try { await this.rkeyFetching; } finally { this.rkeyFetching = null; }
+    }
+
+    /**
+     * Build a directly downloadable URL for an inbound picture, matching
+     * NapCat's FileApi.getImageUrl:
+     *  - NT v2 (appid 1406 private / 1407 group) needs an rkey;
+     *  - everything else uses the md5 path, which needs none.
+     * Returns '' when a usable URL cannot be built.
+     */
+    private picUrl(pic: Record<string, any>): string {
+        const origin = String(pic?.originImageUrl ?? '');
+        const appid = /(?:[?&])appid=(\d+)/.exec(origin)?.[1] ?? '';
+        const fileid = /(?:[?&])fileid=([^&]+)/.exec(origin)?.[1] ?? '';
+        if (appid && fileid && (appid === '1406' || appid === '1407')) {
+            const rkey = appid === '1406' ? this.rkeyData?.private : this.rkeyData?.group;
+            if (rkey) return `https://gchat.qpic.cn/download?appid=${appid}&fileid=${fileid}&rkey=${rkey}&spec=0`;
+            // No rkey yet: the md5 form is the only URL that can work.
+        }
+        const md5 = String(pic?.md5HexStr ?? '').toUpperCase();
+        if (md5) return `https://gchat.qpic.cn/gchatpic_new/0/0-0-${md5}/0`;
+        return '';
+    }
+
     /** Index a media element so get_image/get_record can ask the kernel to download it. */
     private rememberMediaElement(key: string, meta: {
         peer: { chatType: number; peerUid: string; guildId?: string };
@@ -1555,6 +1623,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 peer: { chatType, peerUid, guildId: '' },
                 resolveReplyId: (p2, seq) => this.resolveReplyLocalId(p2, seq),
                 msgId: mid,
+                resolvePicUrl: (pic) => this.picUrl(pic),
                 rememberMedia: (key, meta) => this.rememberMediaElement(key, meta),
             },
         );
@@ -2097,6 +2166,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 const r = await svc.getMsgsByMsgId(peer, [id]);
                 const raw = ((r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[])[0];
                 if (!raw) throw self.msgNotFoundError(String(msgId));
+                await self.ensureRkey();
                 return await self.buildOB11Message(raw);
             },
             async getMsgHistory(peer, msgId, count) {
@@ -2104,6 +2174,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 // kernel: getMsgsIncludeSelf(peer, startMsgId, count, isReverseOrder)
                 const r = await svc.getMsgsIncludeSelf(peer, self.canonicalMsgId(msgId), count, false);
                 const list = ((r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[]);
+                await self.ensureRkey();
                 const out: Array<Record<string, unknown>> = [];
                 for (const raw of list) out.push(await self.buildOB11Message(raw));
                 return out;
@@ -2161,6 +2232,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 // NapCat throws when the page is empty; clients rely on this to
                 // detect "no history" instead of treating it as success.
                 if (list.length === 0) throw new Error(`消息${cur}不存在`);
+                await self.ensureRkey();
                 const out: Array<Record<string, unknown>> = [];
                 for (const raw of list.slice(0, limit)) out.push(await self.buildOB11Message(raw));
                 return out;
@@ -2460,6 +2532,7 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                             selfUid: self.selfUid,
                             peer: fPeer,
                             msgId: String(m.msgId ?? ''),
+                            resolvePicUrl: (pic) => self.picUrl(pic),
                             rememberMedia: (key, meta) => self.rememberMediaElement(key, meta),
                         });
                         const senderUin = String(m.senderUin ?? self.uidToUin.get(String(m.senderUid ?? '')) ?? '');
@@ -2558,6 +2631,13 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 let outFile = '';
                 if (meta.localPath && fs.existsSync(meta.localPath)) {
                     outFile = meta.localPath;
+                } else if (meta.kind === 'image' && meta.url) {
+                    // Image URLs are directly downloadable (rkey-signed for NT
+                    // v2, md5 path otherwise), so skip the kernel download,
+                    // which times out for pictures on this build and used to
+                    // cost a fixed 8s per call. Records still need the kernel
+                    // to produce a local file for transcoding.
+                    return urlFallback();
                 } else if (meta.elementId) {
                     try {
                         outFile = await self.downloadRichMedia(meta, 8_000);

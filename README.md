@@ -182,8 +182,8 @@ docker run -d --name katheryne \
 |---|---|
 | `get_forward_msg` | 实现（`getMultiMsg` 递归读取嵌套转发，结果按节点平铺返回）；需被转发的消息在本会话事件中出现过；已用普通消息验证内核调用路径。响应同时返回 `messages`（go-cqhttp/NapCat 的 `sender`/`time`/`content` 对象）与 `message`（public.md 的 `node` 段，字段在 `data.user_id`/`nickname`/`time`/`content`） |
 | `get_group_honor_info` | 实现（`getGroupHonorList`）；当前 3.2.35 构建返回 `param(group_id) error`，返回空荣誉列表 |
-| `get_image` | 实现（本地路径 / URL / 内核 `downloadRichMedia`）；本地已缓存的图片可返回路径；接收图片未缓存时当前 3.2.35 内核下载常超时，会回退返回 CDN URL（此路径下 `file` 不是本地路径） |
-| `get_record` | 实现（本地路径 / CDN URL / 内核下载，`out_format` 可用系统 ffmpeg 转换）；暂缺真实语音样本实测 |
+| `get_image` | 实现；本地已缓存的图片返回路径，否则直接返回可直接下载的 CDN URL（`file` 与 `url` 均为该 URL，非本地路径）。已实测群聊/私聊图片均返回 `200` |
+| `get_record` | 实现（内核 `downloadRichMedia` 取本地文件，`out_format` 可用系统 ffmpeg 转换，失败回退 CDN URL）；缺少真实语音样本做端到端实测 |
 | `set_restart` | 实现（延迟退出进程，依赖守护进程/容器 restart 策略拉起）；会中断会话，未做破坏性实测 |
 
 ### ⚠️ 平台不支持（3，返回 1404）
@@ -245,9 +245,11 @@ docker run -d --name katheryne \
 | `base64://` | `base64://iVBORw0K...` |
 | 裸 base64 | 能嗅探出 PNG/JPEG/GIF/WEBP/BMP 魔数时按图片处理 |
 | HTTP(S) URL | `https://example.com/a.png`（下载到临时目录，上限 20MB） |
-| 收到的图片 `file` 名 | 若本地已缓存则直接复用；否则尝试索引的 CDN URL（QQ 的 `gchat.qpic.cn/download` 链接通常需要客户端内部下载器，建议改用本地路径/base64） |
+| 收到的图片 `file` 名或消息里的 `url` | 直接复用带 rkey 的 CDN URL 下载后发送（已实测可转发） |
 
 CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（逗号不会被当作参数分隔符）。
+
+**接收图片的 `url` 为什么带 `rkey`**：QQ 的新版图片通道（URL 中 `appid=1406` 私聊 / `1407` 群聊）在下载时校验一个签名参数 `rkey`，不带或过期会返回 `400 {"retcode":-5503010,"retmsg":"invalid rkey"}`。本协议端与 NapCat 的回退做法一致：启动后从公开 rkey 服务获取并缓存，按 `expired_time` 刷新，群聊/私聊分别使用对应的 rkey；走 md5 路径的老图片不需要 rkey。rkey 服务全部不可用时，会回退到按 md5 拼接的 URL（对新通道图片通常同样返回 400），下次查询时自动重试获取，服务恢复后即恢复正常。
 `face` 段直接发送 QQ 小表情（如 `[CQ:face,id=14]`）；Unicode emoji 走 `text` 段。临时图片文件位于 QQ 下载目录，`clean_cache` 会一并清理。
 
 `record` 段的 `file` 支持与图片相同的来源（本地路径 / `file://` / `data:` / `base64://` / 裸 base64 / HTTP(S) URL），并按以下方式处理：
