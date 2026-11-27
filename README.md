@@ -8,7 +8,7 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 
 ## 特性
 
-- **完整 OneBot v11 动作集**（46 个动作：38 个 public API 全部注册 + 8 个扩展，其中 3 个平台不支持），实测 33 个通过，详见[支持矩阵](#onebot-v11-支持矩阵)
+- **完整 OneBot v11 动作集**（48 个动作：38 个 public API 全部注册 + 10 个扩展，其中 3 个平台不支持），实测 35 个通过，详见[支持矩阵](#onebot-v11-支持矩阵)
 - **主动戳一戳可用**：经 MSF 二进制通道发送 OIDB 0xED3_1（含原生插件放行内核 cmd 白名单），群聊/私聊均实测送达，原理见 [docs/poke.md](docs/poke.md)
 - **Web 控制台**：扫码登录、事件流、动作调试器、运行日志
 - **无 asar 解密、不修改磁盘二进制**：只改明文 `resources/app/package.json` 的 `main` 字段
@@ -168,9 +168,9 @@ docker run -d --name katheryne \
 
 `message_id` 是 19 位雪花 ID 的**十进制字符串**（JSON number 会丢精度）。若客户端仍把它转成 Number 再传回，`get_msg`/`delete_msg`/`get_msg_history` 会先按精度误差窗口尝试还原；`get_msg` 仅在唯一匹配时成功，多个候选或无法匹配时返回带提示的 `message not found`（其余接口按内核结果处理）。
 
-### ✅ 已实测通过（33）
+### ✅ 已实测通过（35）
 
-`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`（真撤回）、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_card`、`set_group_name`、`set_group_avatar`、`can_send_image`、`can_send_record`、`get_version_info`、`get_status`、`get_cookies`、`get_csrf_token`、`get_credentials`、`clean_cache`、`get_group_msg_history`、`get_friend_msg_history`、`group_poke`、`friend_poke`
+`send_private_msg`、`send_group_msg`、`send_msg`、`delete_msg`（真撤回）、`get_msg`、`get_msg_history`、`mark_msg_as_read`、`get_login_info`、`get_friend_list`、`get_stranger_info`、`send_like`、`get_group_list`、`get_group_info`、`get_group_info_simple`、`get_group_member_list`、`get_group_member_info`、`set_group_ban`、`set_group_whole_ban`、`set_group_card`、`set_group_name`、`set_group_avatar`、`can_send_image`、`can_send_record`、`get_version_info`、`get_status`、`get_cookies`、`get_csrf_token`、`get_credentials`、`clean_cache`、`get_group_msg_history`、`get_friend_msg_history`、`set_msg_emoji_like`、`fetch_emoji_like`、`group_poke`、`friend_poke`
 
 群管理类均做过可逆恢复验证（禁言→解禁、改名→改回、换头像→恢复原图）；内核返回非 0 时动作会失败，错误信息包含内核 code（OB11 retcode 为 1500）。
 
@@ -266,6 +266,14 @@ CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（�
 ### 扩展动作
 
 此外还提供 `get_msg_history`、`mark_msg_as_read`、`get_group_info_simple`、`set_group_avatar` 等 go-cqhttp 风格扩展。
+
+`set_msg_emoji_like` / `fetch_emoji_like`（NapCat 扩展，给消息贴表情回应）：
+
+- `set_msg_emoji_like`：`message_id`、`emoji_id`、可选 `emoji_type`（`1` = QQ 小黄脸，`2` = 商城/超级表情；不传时按 ID 长度推断）、`set`（默认 `true`，`false` 为取消；接受布尔或 `"true"`/`"false"` 字符串）
+- `fetch_emoji_like`：`message_id`、`emoji_id`、`emoji_type`、`count`（默认 20），返回 `{ result, errMsg, emojiLikesList: [{ tinyId, nickName, headUrl }], cookie, isLastPage, isFirstPage }`，结构与 NapCat 一致；同时兼容驼峰参数名 `emojiId` / `emojiType`
+- 只能操作本协议端返回过的消息（实时消息、历史接口、`get_msg` 均可）
+- 内核错误会原样透出，例如部分群返回 `65017 下游群鉴权失败`（服务端对该群拒绝，实测 8 个群中 7 个可用）
+- **接收事件未实现**：NapCat 的 `group_msg_emoji_like` 通知（别人给消息贴表情）目前没有对应的内核回调——本账号自行贴/取消时 `onMsgInfoListUpdate`、`onMsgAttribute`、灰条通道均无下发，且缺少其他账号操作的真实样本来定位通道，因此没有凭猜测实现
 
 `get_group_msg_history` / `get_friend_msg_history`（go-cqhttp / NapCat 扩展，CyberGroupmate 等客户端用它补抓离线消息）：
 

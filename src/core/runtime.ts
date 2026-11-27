@@ -449,7 +449,6 @@ class KatheryneRuntime {
                 if (p) pending.resolve(p);
                 else pending.reject(new Error('download completed without filePath'));
             },
-            onRecvMsgSvrRspTransInfo: () => undefined,
             onMsgEventListUpdate: () => undefined,
             onSendMsgError: () => undefined,
             onKickedOffLine: (info: { tipsTitle?: string; tipsDesc?: string }) => {
@@ -2178,6 +2177,42 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 const out: Array<Record<string, unknown>> = [];
                 for (const raw of list) out.push(await self.buildOB11Message(raw));
                 return out;
+            },
+            /**
+             * Message emoji reactions (NapCat set_msg_emoji_like /
+             * fetch_emoji_like). The kernel addresses a reaction by the
+             * message's msgSeq, so resolve it from our message_id first.
+             * emojiType: '1' = QQ face, '2' = market/super emoji.
+             */
+            async emojiLikes(msgId: string, emojiId: string, emojiType: string, op: 'set' | 'unset' | 'get', count = 20): Promise<Record<string, unknown>> {
+                const svc = self.requireServices().msg as any;
+                const id = self.canonicalMsgId(String(msgId));
+                const cached = self.msgPeerCache.get(id);
+                if (!cached) throw new Error(`msg not found: ${id}`);
+                const peer = { chatType: cached.chatType, peerUid: cached.peerUid, guildId: '' };
+                const r0 = await svc.getMsgsByMsgId(peer, [id]);
+                const raw = ((r0?.result?.msgList ?? r0?.msgList ?? [])[0]) as any;
+                const msgSeq = String(raw?.msgSeq ?? '');
+                if (!msgSeq) throw new Error(`find msg by msgid error: ${id}`);
+                const type = String(emojiType ?? '') || (String(emojiId).length > 3 ? '2' : '1');
+                if (op === 'get') {
+                    const r = await svc.getMsgEmojiLikesList(peer, msgSeq, String(emojiId), type, '', false, Math.min(Math.max(Number(count) || 20, 1), 100));
+                    const result = Number(r?.result ?? 0);
+                    if (result !== 0) throw new Error(`get emoji likes failed: code=${result} ${String(r?.errMsg ?? '')}`.trim());
+                    const list = (r?.emojiLikesList ?? []) as Array<Record<string, unknown>>;
+                    return {
+                        result,
+                        errMsg: String(r?.errMsg ?? ''),
+                        emojiLikesList: list.map((it) => ({ tinyId: String(it.tinyId ?? ''), nickName: String(it.nickName ?? ''), headUrl: String(it.headUrl ?? '') })),
+                        cookie: String(r?.cookie ?? ''),
+                        isLastPage: Boolean(r?.isLastPage),
+                        isFirstPage: Boolean(r?.isFirstPage),
+                    };
+                }
+                const r = await svc.setMsgEmojiLikes(peer, msgSeq, String(emojiId), type, op === 'set');
+                const result = Number(r?.result ?? 0);
+                if (result !== 0) throw new Error(`set emoji like failed: code=${result} ${String(r?.errMsg ?? '')}`.trim());
+                return { result, errMsg: String(r?.errMsg ?? '') };
             },
             /**
              * NapCat-parity history (go-cqhttp get_group_msg_history /

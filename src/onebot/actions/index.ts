@@ -48,6 +48,8 @@ export interface ActionContext {
     deleteMsg(peer: PeerRef, msgId: string): Promise<void>;
     getMsg(peer: PeerRef, msgId: string): Promise<Record<string, unknown>>;
     getMsgHistory(peer: PeerRef, msgId: string, count: number): Promise<Array<Record<string, unknown>>>;
+    /** Set / unset / list a message emoji reaction (NapCat parity). */
+    emojiLikes(msgId: string, emojiId: string, emojiType: string, op: 'set' | 'unset' | 'get', count?: number): Promise<Record<string, unknown>>;
     /** NapCat-parity chat history (latest N when cursor is empty). */
     getChatHistory(peer: PeerRef, cursor: string, count: number, reverseOrder: boolean): Promise<Array<Record<string, unknown>>>;
     /** Whether a uid is a friend (decides C2C vs temp C2C history peer). */
@@ -244,6 +246,23 @@ const actions: Record<string, ActionHandler> = {
             bool(p, 'reverse_order', false) || bool(p, 'reverseOrder', false),
         );
         return { messages: list };
+    },
+    // ---------- NapCat message reactions ----------
+    set_msg_emoji_like: async (p, ctx) => {
+        const msgId = String(p.message_id ?? '');
+        const emojiId = String(p.emoji_id ?? '');
+        if (!msgId) throw new ActionError(1400, 'message_id is required');
+        // NapCat throws 'emojiId not found' here.
+        if (!emojiId) throw new Error('emojiId not found');
+        await ctx.emojiLikes(msgId, emojiId, String(p.emoji_type ?? p.emojiType ?? ''), bool(p, 'set', true) ? 'set' : 'unset');
+        return {};
+    },
+    fetch_emoji_like: async (p, ctx) => {
+        const msgId = String(p.message_id ?? '');
+        const emojiId = String(p.emoji_id ?? p.emojiId ?? '');
+        if (!msgId) throw new ActionError(1400, 'message_id is required');
+        if (!emojiId) throw new ActionError(1400, 'emoji_id is required');
+        return await ctx.emojiLikes(msgId, emojiId, String(p.emoji_type ?? p.emojiType ?? ''), 'get', num(p, 'count', 20));
     },
     mark_msg_as_read: async (p, ctx) => {
         const mid = String(p.message_id ?? '');
