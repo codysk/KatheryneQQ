@@ -2875,21 +2875,46 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
 
     private buildConsoleBridge(): ConsoleBridge {
         const self = this;
+        const eventStats = { total: 0, message: 0, notice: 0, request: 0 };
+        this.bus.subscribe((ev) => {
+            const pt = String(ev.post_type);
+            if (pt === 'meta_event') return;
+            eventStats.total++;
+            if (pt === 'message' || pt === 'message_sent') eventStats.message++;
+            else if (pt === 'notice') eventStats.notice++;
+            else if (pt === 'request') eventStats.request++;
+        });
+        let cachedAppVer = '0.0.0';
+        try {
+            const vf = new URL('../version.json', import.meta.url);
+            const raw = JSON.parse(fs.readFileSync(vf, 'utf-8')) as { version?: string };
+            if (raw.version) cachedAppVer = String(raw.version);
+        } catch { /* fallback */ }
         return {
             state(): ConsoleRuntimeState {
+                const net = self.network?.stats() ?? { wsClients: 0, reverseWsClients: 0 };
                 return {
                     phase: self.phase,
                     selfUin: self.selfUin,
                     selfNick: self.selfNick,
+                    appVersion: cachedAppVer,
                     version: self.kernel?.packageInfo.version ?? '-',
                     appid: self.loginFlow?.identity.appid ?? '-',
                     loginError: self.loginError,
                     qrcodeDataUrl: self.qrcodeDataUrl,
                     startedAt: self.startedAt,
+                    wsClients: net.wsClients,
+                    reverseWsClients: net.reverseWsClients,
+                    friendCount: self.uinToUid.size,
+                    groupCount: self.groupListCache.size,
+                    eventStats: { ...eventStats },
                 };
             },
             events() {
                 return self.bus.recent;
+            },
+            subscribeEvents(fn) {
+                return self.bus.subscribe(fn);
             },
             async startQRLogin() {
                 await self.startQRLogin();
@@ -2900,19 +2925,18 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
             async cancelLogin() {
                 await self.cancelLogin();
             },
+            async restart() {
+                console.error('[katheryne] console restart requested');
+                setTimeout(() => process.exit(0), 600);
+            },
             actionContext() {
                 return self.phase === 'online' ? self.buildActionContext() : null;
             },
-            scanVtables() {
-                return self.scanVtablesInProcess();
-            },
-            setPacketDebug(on: boolean, count: number) {
-                self.packetDebug = on;
-                self.packetDebugCount = on ? Math.max(1, Math.min(count || 20, 100)) : 0;
-                return { on: self.packetDebug, count: self.packetDebugCount };
-            },
             logs() {
                 return self.consoleMgr?.recentLogs() ?? [];
+            },
+            configDir() {
+                return path.dirname(self.configPath);
             },
             async logins() {
                 if (!self.loginFlow) return [];

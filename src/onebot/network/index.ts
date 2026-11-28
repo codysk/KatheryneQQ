@@ -193,6 +193,10 @@ class WebSocketServerShim {
         }
     }
 
+    clientCount(): number {
+        return this.clients.size;
+    }
+
     close(): void {
         this.server?.close();
         for (const ws of this.clients.values()) ws.close();
@@ -409,6 +413,13 @@ export class NetworkManager {
             this.reverseClients = this.reverseClients.filter((c) => c !== client);
             setTimeout(() => this.connectReverse(urlStr, token).catch(() => undefined), 5000);
         });
+    }
+
+    stats(): { wsClients: number; reverseWsClients: number } {
+        return {
+            wsClients: this.wsServer.clientCount(),
+            reverseWsClients: this.reverseClients.length,
+        };
     }
 
     stop(): void {

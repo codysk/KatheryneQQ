@@ -146,19 +146,18 @@ docker run -d --name katheryne \
 
 ## Web 控制台
 
-启动后打开 `http://127.0.0.1:6099/console`（NapCat WebUI 风格多页布局，支持浅色/深色主题）：
+启动后打开 `http://127.0.0.1:6099/console`（工业战术终端风格，默认工业白亮色主题，一键切换冷碳黑暗色；基于 SSE `/api/stream` 实时推送，零外部前端依赖）：
 
-- **基础信息**：账号头像/昵称、在线状态、运行时长、QQ 版本/AppID、网络服务地址、最近事件
-- **QQ 登录**：快速登录（本地账号列表 + 头像）/ 扫码登录（二维码自动刷新）
-- **网络配置**：HTTP / WebSocket / 反向 WS / 控制台状态 + `config.json` 在线编辑（保存后重启生效）
-- **运行日志**：分级过滤、暂停、自动滚动
-- **接口调试**：动作下拉 + JSON 参数 + 结果展示 + 最近 10 条执行历史
-- **事件流**：类型过滤、全文搜索、暂停、展开原始 JSON
-- **关于**：QQ 内核版本信息与文档链接
+- **未登录独立认证舞台**：本地账号快速登录（带头像）与扫码登录（二维码自动刷新）
+- **01 // 系统总览**：账号状态、一键重启、运行时长、WS/反向 WS 实时连接数、群/好友数、60 秒事件信号遥测折线、接入端点一键复制；支持**无看板娘纯工业蓝图**与**战术看板娘立绘**两种形态
+- **02 // 事件监视**：左实时流（默认隐藏心跳、支持分类与关键词过滤、增量追加不打断查看）+ 右常驻语法高亮 JSON 检视器 + 上下文快捷操作（一键跳到指令台查原消息/回复/贴表情）
+- **03 // 指令台**：全量动作分组搜索目录、内置参数模板、群号快捷选择、`Ctrl+Enter` 执行、语法高亮响应与本地历史记录
+- **04 // 终端日志**：SSE 增量追加不打断选区复制、分级过滤、关键词搜索、暂停与导出 `.log`
+- **05 // 系统配置**：可视化表单编辑（HTTP / WS / 反向 WS / 控制台 / 随机生成 Token / 保存并重启）、JSON 源码编辑、以及**看板娘视觉工坊**（支持网页上传持久化到 `/data/mascot.*`、外部 URL 或挂载 `/data/mascot.(png|webp)` 自动加载，可调透明度、缩放、偏移与展示模式）
 
-配置了 `username`/`password` 时启用 HTTP Basic 认证。控制台 API：`/api/state`、`/api/events`、
+配置了 `username`/`password` 时启用 HTTP Basic 认证。控制台 API：`/api/state`、`/api/stream`（SSE）、`/api/events`、
 `/api/logs`、`/api/actions`、`/api/action`、`/api/logins`、`/api/config`（GET/POST）、
-`/api/login/qr|quick|cancel`。
+`/api/login/qr|quick|cancel`、`/api/mascot`（GET/POST/DELETE）、`/api/restart`。
 
 ## OneBot v11 支持矩阵
 
