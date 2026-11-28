@@ -33,6 +33,7 @@ import { LoginFlow } from '../nt/login.js';
 import { collectServices, groupPeer, c2cPeer, type SessionServices } from '../nt/session.js';
 import type { RawMessage } from '../nt/session.js';
 import { EventBus, segmentsToRawText, groupNotifyToNotice, type OB11AnyEvent } from '../onebot/events/bus.js';
+import { parseGroupEmojiLikeSysMsg } from '../onebot/events/emojiLike.js';
 import { ntElementsToSegments, segmentsToCQCode, type OB11Segment } from '../onebot/message/segments.js';
 import { NetworkManager, type NetworkConfig } from '../onebot/network/index.js';
 import { dispatchAction, type ActionContext } from '../onebot/actions/index.js';
@@ -450,6 +451,11 @@ class KatheryneRuntime {
                 else pending.reject(new Error('download completed without filePath'));
             },
             onMsgEventListUpdate: () => undefined,
+            onSysMsgNotification: (businessType: number, msgType: string, subType: string, online: boolean, msgBuf: number[]) => {
+                if (businessType === 0 && String(msgType) === '732' && String(subType) === '16') {
+                    void this.handleGroupEmojiLikeSysMsg(online, msgBuf);
+                }
+            },
             onSendMsgError: () => undefined,
             onKickedOffLine: (info: { tipsTitle?: string; tipsDesc?: string }) => {
                 this.bus.emit({
@@ -470,6 +476,15 @@ class KatheryneRuntime {
             } catch {
                 // auto-start path
             }
+        }
+        // Subscribe to group 0x2dc_0x10 (732/16) system notifications so
+        // emoji reaction pushes (service_type=35, event_type=4) reach JS via
+        // onSysMsgNotification without needing a focused GUI chat window.
+        try {
+            void Promise.resolve(msgService.registerSysMsgNotification?.(0, '732', ['16']))
+                .catch((e) => console.error('[katheryne] registerSysMsgNotification(0, 732, [16]) failed:', e));
+        } catch (e) {
+            console.error('[katheryne] registerSysMsgNotification(0, 732, [16]) error:', e);
         }
     }
 
@@ -660,6 +675,109 @@ class KatheryneRuntime {
 
 
     private reportedRecalls = new Set<string>();
+    private reportedEmojiLikes = new Set<string>();
+    /** "groupCode:msgSeq" -> real snowflake msgId (skipping KMSGTYPENULL placeholders). */
+    private groupSeqToMsgId = new Map<string, string>();
+
+    private rememberGroupSeq(groupCode: string, msgSeq: string, msgId: string): void {
+        if (!groupCode || !msgSeq || !msgId) return;
+        const key = `${groupCode}:${msgSeq}`;
+        this.groupSeqToMsgId.set(key, msgId);
+        if (this.groupSeqToMsgId.size > 2000) {
+            const oldest = this.groupSeqToMsgId.keys().next().value;
+            if (oldest !== undefined) this.groupSeqToMsgId.delete(oldest);
+        }
+    }
+
+    /**
+     * Resolve a group (groupCode, msgSeq) to the real chat message's snowflake
+     * msgId. QQNT stores KMSGTYPENULL (msgType=1) placeholder rows under the
+     * same msgSeq for every 0x2dc_0x10 sysmsg, so a count=1 lookup would return
+     * the placeholder instead of the original message.
+     */
+    private async resolveGroupMsgIdBySeq(groupCode: string, msgSeq: string): Promise<string> {
+        const cached = this.groupSeqToMsgId.get(`${groupCode}:${msgSeq}`);
+        if (cached) return cached;
+        const svc = this.services?.msg;
+        if (!svc) return '';
+        const peer = { chatType: 2, peerUid: groupCode, guildId: '' };
+        const isRealHit = (m: RawMessage): boolean => {
+            if (!m?.msgId || String(m.msgSeq) !== msgSeq) return false;
+            const t = Number((m as Record<string, unknown>).msgType ?? 0);
+            if (t === 1 || t === 5) return false; // skip KMSGTYPENULL & gray tips
+            return true;
+        };
+        try {
+            const r = await svc.getMsgsBySeqAndCount(peer, msgSeq, 50, true, true);
+            const list = (r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[];
+            const hit = list.find(isRealHit);
+            if (hit?.msgId) {
+                const id = String(hit.msgId);
+                this.rememberGroupSeq(groupCode, msgSeq, id);
+                this.rememberMsgId(id);
+                this.msgPeerCache.set(id, { chatType: 2, peerUid: groupCode, msgSeq });
+                return id;
+            }
+        } catch { /* fall through */ }
+        try {
+            const r = await svc.getAioFirstViewLatestMsgs(peer, 50);
+            const list = (r?.result?.msgList ?? r?.msgList ?? []) as RawMessage[];
+            const hit = list.find(isRealHit);
+            if (hit?.msgId) {
+                const id = String(hit.msgId);
+                this.rememberGroupSeq(groupCode, msgSeq, id);
+                this.rememberMsgId(id);
+                this.msgPeerCache.set(id, { chatType: 2, peerUid: groupCode, msgSeq });
+                return id;
+            }
+        } catch { /* fall through */ }
+        return '';
+    }
+
+    /** Emit NapCat-compatible group_msg_emoji_like notices from 0x2dc_0x10 pushes. */
+    private async handleGroupEmojiLikeSysMsg(online: boolean, msgBuf: number[]): Promise<void> {
+        try {
+            const items = parseGroupEmojiLikeSysMsg(msgBuf);
+            if (items.length === 0) return;
+            const asId = (v: string): number | string => (Number(v) > 0 ? Number(v) : v);
+
+            for (const item of items) {
+                // Skip offline/pre-boot backlog pushes on startup.
+                if (item.msgTime > 0 && item.msgTime < this.bootTimeSec) continue;
+                if (!online && item.msgTime === 0) continue;
+
+                const dedupKey = `${item.groupCode}:${item.eventSeq}:${item.msgSeq}:${item.emojiId}:${item.operatorUid}:${item.isAdd ? 1 : 0}`;
+                if (this.reportedEmojiLikes.has(dedupKey)) continue;
+                this.reportedEmojiLikes.add(dedupKey);
+                if (this.reportedEmojiLikes.size > 500) this.reportedEmojiLikes.clear();
+
+                // Resolve operator uid -> numeric uin (try uix/profile, then group member list).
+                let operatorUin = (await this.uinOfUid(item.operatorUid)) || this.resolveUidLive(item.operatorUid) || '';
+                if (!operatorUin) {
+                    await this.ensureMemberInfo(item.groupCode);
+                    operatorUin = this.uidToUin.get(item.operatorUid) ?? '';
+                }
+
+                // Resolve msgSeq -> real chat message snowflake message_id.
+                const messageId = await this.resolveGroupMsgIdBySeq(item.groupCode, item.msgSeq);
+
+                this.bus.emit({
+                    time: item.msgTime || Math.floor(Date.now() / 1000),
+                    self_id: Number(this.selfUin) || this.selfUin,
+                    post_type: 'notice',
+                    notice_type: 'group_msg_emoji_like',
+                    group_id: asId(item.groupCode),
+                    user_id: asId(operatorUin || item.operatorUid),
+                    message_id: messageId || item.msgSeq,
+                    likes: [{ emoji_id: item.emojiId, count: item.count }],
+                    is_add: item.isAdd,
+                } as never);
+                this.consoleMgr?.log(`emoji_like: group=${item.groupCode} user=${operatorUin || item.operatorUid} msg=${messageId || item.msgSeq} emoji=${item.emojiId} ${item.isAdd ? '+' : '-'}(${item.count})`);
+            }
+        } catch (e) {
+            console.error('[katheryne] group emoji like handler error', e);
+        }
+    }
 
     /** Emit recall notice from a gray-tip update (NapCat handleRecallMessage pattern). */
     private async emitRecallEvent(m: RawMessage, revoke: Record<string, any>): Promise<void> {
@@ -1447,6 +1565,10 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
                 const info = getInfo(uid) ?? {};
                 const u = String(info.uin ?? '');
                 if (!u) continue;
+                if (uid && u !== '0') {
+                    this.uidToUin.set(uid, u);
+                    this.uinToUid.set(u, uid);
+                }
                 const roleNum = Number(info.role ?? 0);
                 byUin.set(u, {
                     nick: String(info.nick ?? ''),
@@ -1589,8 +1711,13 @@ msgService.sendSsoCmdReqByContend(full, packet.toString('latin1')),
         const senderUin = senderUinRaw || this.uidToUin.get(senderUid) || '';
         const sent = sentOverride ?? (!!senderUin && senderUin === this.selfUin);
         const mid = String(m.msgId ?? '');
+        const mseq = String(m.msgSeq ?? '');
+        const mtype = Number((m as Record<string, unknown>).msgType ?? 0);
         if (mid) this.rememberMsgId(mid);
-        if (mid && peerUid) this.msgPeerCache.set(mid, { chatType, peerUid });
+        if (mid && peerUid) this.msgPeerCache.set(mid, { chatType, peerUid, msgSeq: mseq || undefined });
+        if (isGroup && mid && mseq && peerUin && mtype !== 1 && mtype !== 5) {
+            this.rememberGroupSeq(String(peerUin), mseq, mid);
+        }
 
         let nick = String(m.senderNick ?? '');
         let card = '';

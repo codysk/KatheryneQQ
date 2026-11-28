@@ -15,7 +15,7 @@ OneBot v11 机器人框架，面向 **QQNT Linux**（3.2.X），通过 NT 内核
 - **默认进程足迹极小**：无代码 trampoline；仅 1 个约 17KB 的原生插件在首次 poke 时懒加载并常驻，改 16 字节 RELRO 表项并恢复页权限（详见 [docs/poke.md](docs/poke.md)）
 - **无 renderer 注入**：headless 直接驱动内核，QQ 渲染进程不启动
 - **消息段**：text / at / face / image / record / reply / json / file（`file` 目前只支持接收群文件消息，发送会被忽略）；字符串消息按 CQ 码解析（`auto_escape` 可关闭）；图片支持本地路径、`data:` URI、`base64://`、HTTP(S) URL；语音支持 SILK 直发、WAV 内置转码，其它格式/采样率经 ffmpeg 转换
-- **事件**：message / message_sent / notice（撤回、戳一戳、群变动、群文件、群名片、禁言）/ request / meta_event，字段与 NapCat 对齐（`sender.role`、CQ `raw_message`、`message_seq`/`real_seq`、30s 心跳）
+- **事件**：message / message_sent / notice（撤回、戳一戳、表情回应、群变动、群文件、群名片、禁言）/ request / meta_event，字段与 NapCat 对齐（`sender.role`、CQ `raw_message`、`message_seq`/`real_seq`、30s 心跳）
 
 ## 兼容性
 
@@ -213,7 +213,7 @@ docker run -d --name katheryne \
 
 ### 事件
 
-`message` / `message_sent`（私聊/群聊）、`notice`（群增减员、踢出、禁言/解禁、群名变更、群名片、群文件、群撤回、戳一戳、好友撤回）、`request`（好友/加群请求）、`meta_event`（`lifecycle` connect、`heartbeat`）。
+`message` / `message_sent`（私聊/群聊）、`notice`（群增减员、踢出、禁言/解禁、群名变更、群名片、群文件、群撤回、戳一戳、群消息表情回应、好友撤回）、`request`（好友/加群请求）、`meta_event`（`lifecycle` connect、`heartbeat`）。
 
 与 NapCat 对齐的关键字段：
 
@@ -224,6 +224,7 @@ docker run -d --name katheryne \
 | 戳一戳（WS 事件格式未实测） | `notice_type: "notify"`, `sub_type: "poke"`，`user_id`/`target_id` 目标为 QQ 号（非 uid），私聊另有 `sender_id`，附 `raw_info`；发送侧群聊/私聊已验证送达，接收侧格式待一次真实 poke 复核 |
 | 群禁言 | `group_ban`，`sub_type: ban`/`lift_ban`，`user_id`/`operator_id` 为数字 QQ 号；全员禁言 `user_id: 0`、`duration: -1`，解除为 `duration: 0` |
 | 群名/群名片 | `notify.group_name`（`name_new`，已实测）、`group_card`（`card_new`/`card_old`，未实测） |
+| 群消息表情回应 | `group_msg_emoji_like`（已实测）：经 `registerSysMsgNotification(0, "732", ["16"])` 订阅 `0x2dc_0x10`（`service_type=35`）推送，含 `group_id`、数字 `user_id`、19 位雪花 `message_id`、`likes: [{ emoji_id, count }]`、`is_add`（true 贴 / false 取消）；支持小黄脸与 Unicode 表情（本账号自己操作时服务端不回推） |
 | 群文件（未实测） | `group_upload`，`file: {id, name, size, busid}`，同时消息事件内保留 `file` 段；尚无真实群文件上传样本 |
 | 群请求/通知（未实测） | 按内核 `GroupNotifyMsgType` 映射为 `request group`（add/invite）与 `group_increase`/`group_decrease`/`group_admin`；`flag` 为通知 `seq`；尚无真实申请/入群/踢人样本 |
 
@@ -273,7 +274,7 @@ CQ 字符串里的 `[CQ:image,file=data:image/png;base64,...]` 也已兼容（�
 - `fetch_emoji_like`：`message_id`、`emoji_id`、`emoji_type`、`count`（默认 20），返回 `{ result, errMsg, emojiLikesList: [{ tinyId, nickName, headUrl }], cookie, isLastPage, isFirstPage }`，结构与 NapCat 一致；同时兼容驼峰参数名 `emojiId` / `emojiType`
 - 只能操作本协议端返回过的消息（实时消息、历史接口、`get_msg` 均可）
 - 内核错误会原样透出，例如部分群返回 `65017 下游群鉴权失败`（服务端对该群拒绝，实测 8 个群中 7 个可用）
-- **接收事件未实现**：NapCat 的 `group_msg_emoji_like` 通知（别人给消息贴表情）目前没有对应的内核回调——本账号自行贴/取消时 `onMsgInfoListUpdate`、`onMsgAttribute`、灰条通道均无下发，且缺少其他账号操作的真实样本来定位通道，因此没有凭猜测实现
+- **接收事件已支持（已实测）**：别人给群消息贴/取消表情时推送 NapCat 格式 `notice` 事件 `group_msg_emoji_like`（`group_id`、`user_id`、`message_id`、`likes: [{ emoji_id, count }]`、`is_add`）。通过官方 `msgService.registerSysMsgNotification(0, "732", ["16"])` 订阅 `0x2dc_0x10`（`service_type=35`）系统推送并在 `NodeIKernelMsgListener.onSysMsgNotification` 解码实现，无需修改 QQ 二进制；本账号自行操作时腾讯服务端不回推
 
 `get_group_msg_history` / `get_friend_msg_history`（go-cqhttp / NapCat 扩展，CyberGroupmate 等客户端用它补抓离线消息）：
 
